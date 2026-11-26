@@ -135,6 +135,9 @@ data class DriverTerminalUiState(
     val showHazardModal: Boolean = false,
     val showChatSheet: Boolean = false,
     val chatMessages: List<ChatMessage> = emptyList(),
+    val unreadChatCount: Int = 0,
+    val quickMessageCooldownSeconds: Int = 0,
+    val passengerLiveLocation: Pair<Double, Double>? = null,
     val blockedUserIds: Set<String> = emptySet(),
     val notifications: List<DriverNotification> = emptyList(),
     val expenses: List<DriverExpense> = emptyList(),
@@ -262,6 +265,9 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
     private var bindingJobs = mutableListOf<Job>()
     private var chatJob: Job? = null
     private var activeChatRideId: String? = null
+    private var lastAlertedChatMsgId: String? = null
+    private var passengerLocationJob: Job? = null
+    private var activePassengerLocId: String? = null
     private var presenceJob: Job? = null
     private var waitingStartedAtMs: Long? = null
     private var stopWaitStartMs: Long? = null
@@ -402,6 +408,8 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         bindingJobs.forEach { it.cancel() }
         bindingJobs.clear()
         chatJob?.cancel()
+        passengerLocationJob?.cancel()
+        activePassengerLocId = null
         presenceJob?.cancel()
         boundUid = null
     }
@@ -626,6 +634,9 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                     if (state.isAwaitingCashConfirm && state.cashConfirmSecondsLeft > 0) {
                         next = next.copy(cashConfirmSecondsLeft = (state.cashConfirmSecondsLeft - 1).coerceAtLeast(0))
                     }
+                    if (state.quickMessageCooldownSeconds > 0) {
+                        next = next.copy(quickMessageCooldownSeconds = (state.quickMessageCooldownSeconds - 1).coerceAtLeast(0))
+                    }
                     // Check 30s stationary auto-arrival within 200m of pickup
                     val proxStart = pickupProximityStartMs
                     if (state.rideState == TerminalRideState.EN_ROUTE_PICKUP && proxStart != null && (now - proxStart) >= 30_000L && !state.isBusy) {
@@ -815,6 +826,13 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 }
                 midTripNotice = noticeText
 
+                // Sync updated destination dropoffLat/Lng to live_tracking so passenger & dispatch have fresh dropoff coords
+                if (dropoffChanged) {
+                    viewModelScope.launch(Dispatchers.IO) {
+                        repository.syncActiveRideDropoff(uid, currentActive.dropoffLat, currentActive.dropoffLng)
+                    }
+                }
+
                 // If dropoff shifted >1 mile and driver has a queued stacked ride, warn driver
                 if (dropoffChanged && queuedStacked != null) {
                     val shiftMeters = distanceMeters(prev.dropoffLat, prev.dropoffLng, currentActive.dropoffLat, currentActive.dropoffLng)
@@ -832,18 +850,67 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         lastTrackedActiveRide = currentActive
         lastActiveRideId = currentActive?.id
 
-        // Bind chat stream to active ride if changed
+        // Bind chat stream to active ride if changed (with unread badge + chime + vibration when closed)
         if (currentActive?.id != activeChatRideId) {
             chatJob?.cancel()
             activeChatRideId = currentActive?.id
+            lastAlertedChatMsgId = null
             if (currentActive != null) {
+                var initialBatchLoaded = false
                 chatJob = viewModelScope.launch {
                     repository.observeRideChat(currentActive.id).collect { msgs ->
-                        _uiState.update { it.copy(chatMessages = msgs) }
+                        val latestRemote = msgs.lastOrNull { it.senderId != uid }
+                        val stateNow = _uiState.value
+                        if (!initialBatchLoaded) {
+                            initialBatchLoaded = true
+                            lastAlertedChatMsgId = latestRemote?.id
+                            _uiState.update { it.copy(chatMessages = msgs) }
+                        } else if (latestRemote != null && latestRemote.id != lastAlertedChatMsgId) {
+                            lastAlertedChatMsgId = latestRemote.id
+                            if (!stateNow.showChatSheet) {
+                                audioFeedback.playChatMessageChime(stateNow.profile.muteRideOfferAlerts)
+                                ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 90, 60, 90))
+                                _uiState.update {
+                                    it.copy(
+                                        chatMessages = msgs,
+                                        unreadChatCount = it.unreadChatCount + 1
+                                    )
+                                }
+                            } else {
+                                _uiState.update { it.copy(chatMessages = msgs, unreadChatCount = 0) }
+                            }
+                        } else {
+                            _uiState.update { it.copy(chatMessages = msgs) }
+                        }
                     }
                 }
             } else {
-                _uiState.update { it.copy(chatMessages = emptyList(), showChatSheet = false) }
+                _uiState.update {
+                    it.copy(
+                        chatMessages = emptyList(),
+                        unreadChatCount = 0,
+                        showChatSheet = false
+                    )
+                }
+            }
+        }
+
+        // Bind passenger live GPS tracking (`live_tracking/{passengerId}`) during pickup & waiting
+        val needsPassengerGps = currentActive != null &&
+            currentActive.passengerId.isNotBlank() &&
+            currentActive.status.lowercase() in setOf("accepted", "en_route", "en_route_pickup", "arrived", "waiting")
+        val targetPassengerId = if (needsPassengerGps) currentActive!!.passengerId else null
+        if (targetPassengerId != activePassengerLocId) {
+            passengerLocationJob?.cancel()
+            activePassengerLocId = targetPassengerId
+            if (targetPassengerId != null) {
+                passengerLocationJob = viewModelScope.launch {
+                    repository.observePassengerLiveLocation(targetPassengerId).collect { coords ->
+                        _uiState.update { it.copy(passengerLiveLocation = coords) }
+                    }
+                }
+            } else {
+                _uiState.update { it.copy(passengerLiveLocation = null) }
             }
         }
 
@@ -1051,7 +1118,12 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
     }
 
     fun setChatSheetVisible(visible: Boolean) {
-        _uiState.update { it.copy(showChatSheet = visible) }
+        _uiState.update {
+            it.copy(
+                showChatSheet = visible,
+                unreadChatCount = if (visible) 0 else it.unreadChatCount
+            )
+        }
         val rideId = _uiState.value.activeRide?.id
         if (visible && rideId != null) {
             startChatPresence(rideId)
@@ -1147,14 +1219,19 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
     // --- Server-Authoritative Ride Lifecycle ---
 
     fun acceptOffer(isStacked: Boolean = false) {
-        val offer = if (isStacked) _uiState.value.stackedRideOffer else _uiState.value.incomingOffer
+        val state = _uiState.value
+        val offer = if (isStacked) state.stackedRideOffer else state.incomingOffer
         if (offer == null) return
+        val uid = state.uid
         consecutiveMissedOffers = 0
         viewModelScope.launch {
             _uiState.update { it.copy(isBusy = true) }
             when (val res = ApiClient.safeCall { ApiClient.service.acceptRide(RideAcceptRequest(offer.id)) }) {
                 is ApiResult.Success -> {
                     ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 70))
+                    if (isStacked && uid.isNotBlank()) {
+                        repository.syncActiveRideDropoff(uid, offer.dropoffLat, offer.dropoffLng)
+                    }
                     _uiState.update {
                         it.copy(
                             isBusy = false,
@@ -1165,6 +1242,52 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                     }
                 }
                 is ApiResult.Error -> {
+                    // Fallback for server/passenger-dispatched `"offered"` rides where `assignedDriverId == uid`
+                    // causes `/api/rides/accept` to reject with 409 Conflict.
+                    val isDirectOfferToMe = res.isConflict &&
+                        uid.isNotBlank() &&
+                        offer.status.equals("offered", ignoreCase = true) &&
+                        offer.assignedDriverId == uid
+                    if (isDirectOfferToMe) {
+                        val txResult = repository.claimOfferedRideTransaction(
+                            rideId = offer.id,
+                            driverUid = uid,
+                            passengerId = offer.passengerId.takeIf { it.isNotBlank() },
+                            dropoffLat = offer.dropoffLat,
+                            dropoffLng = offer.dropoffLng,
+                            isStacked = isStacked
+                        )
+                        if (txResult.isSuccess) {
+                            ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 70))
+                            if (offer.passengerId.isNotBlank()) {
+                                ApiClient.safeCall {
+                                    ApiClient.service.sendChatPush(
+                                        ChatPushRequest(
+                                            rideId = offer.id,
+                                            recipientId = offer.passengerId,
+                                            title = if (isStacked) "Driver Assigned" else "Driver On The Way",
+                                            message = if (isStacked) {
+                                                "A driver has been assigned and will head to you after their current dropoff."
+                                            } else {
+                                                "${state.profile.fullName} has accepted your ride and is heading to pickup."
+                                            },
+                                            type = "ride_update"
+                                        )
+                                    )
+                                }
+                            }
+                            _uiState.update {
+                                it.copy(
+                                    isBusy = false,
+                                    incomingOffer = if (!isStacked) null else it.incomingOffer,
+                                    stackedRideOffer = if (isStacked) null else it.stackedRideOffer,
+                                    toastMessage = if (isStacked) "Next ride queued! Finish current trip first." else "Ride accepted! Navigating to pickup."
+                                )
+                            }
+                            return@launch
+                        }
+                    }
+
                     _uiState.update {
                         it.copy(
                             isBusy = false,
@@ -1299,6 +1422,19 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 is ApiResult.Success -> {
                     ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 100, 50, 100))
                     hasReachedCurrentStopKey = null
+                    if (ride.passengerId.isNotBlank()) {
+                        ApiClient.safeCall {
+                            ApiClient.service.sendChatPush(
+                                ChatPushRequest(
+                                    rideId = ride.id,
+                                    recipientId = ride.passengerId,
+                                    title = "Trip Started",
+                                    message = "Your AnyRoller journey to ${ride.dropoffAddress} has started.",
+                                    type = "ride_update"
+                                )
+                            )
+                        }
+                    }
                     _uiState.update {
                         it.copy(
                             isBusy = false,
@@ -1451,6 +1587,21 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
             ) {
                 is ApiResult.Success -> {
                     ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 80))
+                    if (ride.passengerId.isNotBlank()) {
+                        val nextLabel = ride.stops.getOrNull(nextIndex)?.address?.takeIf { it.isNotBlank() }
+                            ?: ride.dropoffAddress
+                        ApiClient.safeCall {
+                            ApiClient.service.sendChatPush(
+                                ChatPushRequest(
+                                    rideId = ride.id,
+                                    recipientId = ride.passengerId,
+                                    title = "Stop ${ride.currentStopIndex + 1} Completed",
+                                    message = "Heading to $nextLabel.",
+                                    type = "ride_update"
+                                )
+                            )
+                        }
+                    }
                     _uiState.update {
                         it.copy(
                             isBusy = false,
@@ -1710,6 +1861,10 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 prefsStore.setOnlineFlag(false)
                 repository.markDriverOfflineInFirestore(state.uid)
             }
+        } else if (state.queuedStackedRide == null && state.uid.isNotBlank()) {
+            viewModelScope.launch(Dispatchers.IO) {
+                repository.markDriverIdleStatus(state.uid)
+            }
         }
         resetPerRideTransientState()
         lastActiveRideId = null
@@ -1786,6 +1941,16 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 )
             }
             val nextQueued = _uiState.value.queuedStackedRide ?: _uiState.value.activeRide?.takeIf { it.id != ride.id }
+            if (nextQueued != null && state.uid.isNotBlank()) {
+                repository.activateQueuedRideInLiveTracking(
+                    uid = state.uid,
+                    rideId = nextQueued.id,
+                    passengerId = nextQueued.passengerId.takeIf { it.isNotBlank() },
+                    dropoffLat = nextQueued.dropoffLat,
+                    dropoffLng = nextQueued.dropoffLng,
+                    isStackingEnabled = state.profile.stackingEnabled
+                )
+            }
             _uiState.update {
                 it.copy(
                     isBusy = false,
@@ -1860,6 +2025,13 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 }
             }
         }
+    }
+
+    fun sendQuickChatMessage(text: String) {
+        val state = _uiState.value
+        if (state.quickMessageCooldownSeconds > 0 || text.isBlank()) return
+        _uiState.update { it.copy(quickMessageCooldownSeconds = 120) }
+        sendChatMessage(text)
     }
 
     private fun startChatPresence(rideId: String) {

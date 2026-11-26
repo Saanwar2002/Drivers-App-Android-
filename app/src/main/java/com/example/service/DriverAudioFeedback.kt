@@ -86,6 +86,24 @@ class DriverAudioFeedback(context: Context) {
     }
 
     /**
+     * Plays a crisp short notification pip when a passenger sends a live chat message while chat is closed.
+     */
+    fun playChatMessageChime(muteOfferAlerts: Boolean) {
+        if (muteOfferAlerts) return
+        scope.launch {
+            runCatching {
+                val tg = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80)
+                try {
+                    tg.startTone(ToneGenerator.TONE_PROP_BEEP, 140)
+                    delay(180L)
+                } finally {
+                    tg.release()
+                }
+            }
+        }
+    }
+
+    /**
      * Speaks concise UK English heads-up driving announcements unless `muteHeadsUp` is enabled.
      */
     fun speakHeadsUp(text: String, muteHeadsUp: Boolean) {

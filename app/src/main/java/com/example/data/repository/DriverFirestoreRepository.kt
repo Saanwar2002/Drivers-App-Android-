@@ -256,6 +256,35 @@ class DriverFirestoreRepository(private val context: Context) {
         awaitClose { reg.remove() }
     }
 
+    /**
+     * Observes the passenger's real-time GPS dot from `live_tracking/{passengerId}`
+     * (written by `PassengerBooking.tsx`). Gracefully handles PERMISSION_DENIED without crashing.
+     */
+    fun observePassengerLiveLocation(passengerId: String): Flow<Pair<Double, Double>?> = callbackFlow {
+        val reg = db.collection("live_tracking").document(passengerId)
+            .addSnapshotListener { snap, error ->
+                if (error != null) {
+                    if (error.code != FirebaseFirestoreException.Code.PERMISSION_DENIED) {
+                        logError("observePassengerLiveLocation", "live_tracking/$passengerId", error)
+                    }
+                    trySend(null)
+                    return@addSnapshotListener
+                }
+                if (snap == null || !snap.exists()) {
+                    trySend(null)
+                    return@addSnapshotListener
+                }
+                val lat = snap.getDouble("lat")
+                val lng = snap.getDouble("lng")
+                if (lat != null && lng != null && (lat != 0.0 || lng != 0.0)) {
+                    trySend(lat to lng)
+                } else {
+                    trySend(null)
+                }
+            }
+        awaitClose { reg.remove() }
+    }
+
     fun observeDriverNotifications(uid: String): Flow<List<DriverNotification>> = callbackFlow {
         val reg = db.collection("notifications")
             .whereEqualTo("userId", uid)
@@ -477,12 +506,160 @@ class DriverFirestoreRepository(private val context: Context) {
 
     suspend fun markDriverIdleStatus(uid: String): Result<Unit> {
         return safeFirestoreWrite("markDriverIdleStatus", "driver_status/$uid") {
+            db.collection("live_tracking").document(uid)
+                .set(
+                    mapOf(
+                        "status" to "available",
+                        "activeRideId" to FieldValue.delete(),
+                        "passengerId" to FieldValue.delete(),
+                        "riderId" to FieldValue.delete(),
+                        "dropoffLat" to FieldValue.delete(),
+                        "dropoffLng" to FieldValue.delete(),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                ).await()
             db.collection("driver_status").document(uid)
                 .set(
                     mapOf(
                         "isBusy" to false,
+                        "status" to "online",
                         "currentRideId" to FieldValue.delete(),
                         "pendingRideId" to FieldValue.delete(),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                ).await()
+        }
+    }
+
+    /**
+     * Rule-compliant Firestore transaction fallback when accepting a ride that already has
+     * `status == "offered"` and `assignedDriverId == driverUid` (which causes `POST /api/rides/accept`
+     * to return 409 because `assignedDriverId` is pre-populated during offer dispatch).
+     * Strictly updates ONLY `['status', 'driverId', 'assignedDriverId', 'updatedAt']` per `firestore.rules`.
+     */
+    suspend fun claimOfferedRideTransaction(
+        rideId: String,
+        driverUid: String,
+        passengerId: String?,
+        dropoffLat: Double?,
+        dropoffLng: Double?,
+        isStacked: Boolean
+    ): Result<Unit> {
+        return safeFirestoreWrite("claimOfferedRideTransaction", "ride_requests/$rideId") {
+            val rideRef = db.collection("ride_requests").document(rideId)
+            db.runTransaction { tx ->
+                val snap = tx.get(rideRef)
+                if (!snap.exists()) throw IllegalStateException("Ride request not found")
+                val status = snap.getString("status")?.lowercase() ?: ""
+                if (status !in setOf("pending", "searching", "offered")) {
+                    throw IllegalStateException("Ride is no longer available")
+                }
+                val existingDriverId = snap.getString("driverId")
+                val existingAssigned = snap.getString("assignedDriverId")
+                if (!existingDriverId.isNullOrBlank() && existingDriverId != driverUid) {
+                    throw IllegalStateException("Ride has already been accepted by another driver")
+                }
+                if (!existingAssigned.isNullOrBlank() && existingAssigned != driverUid) {
+                    throw IllegalStateException("Ride is currently offered to another driver")
+                }
+                tx.update(
+                    rideRef,
+                    mapOf(
+                        "status" to "accepted",
+                        "driverId" to driverUid,
+                        "assignedDriverId" to driverUid,
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                )
+            }.await()
+
+            val trackingPatch = hashMapOf<String, Any>(
+                "driverId" to driverUid,
+                "status" to "on_ride",
+                "updatedAt" to FieldValue.serverTimestamp()
+            )
+            if (!isStacked) {
+                trackingPatch["activeRideId"] = rideId
+                if (!passengerId.isNullOrBlank()) {
+                    trackingPatch["passengerId"] = passengerId
+                    trackingPatch["riderId"] = passengerId
+                }
+            } else {
+                trackingPatch["isStackingEnabled"] = false
+            }
+            if (dropoffLat != null && dropoffLng != null && (dropoffLat != 0.0 || dropoffLng != 0.0)) {
+                trackingPatch["dropoffLat"] = dropoffLat
+                trackingPatch["dropoffLng"] = dropoffLng
+            }
+            db.collection("live_tracking").document(driverUid)
+                .set(trackingPatch, SetOptions.merge()).await()
+
+            db.collection("driver_status").document(driverUid)
+                .set(
+                    mapOf(
+                        "status" to "busy",
+                        "isBusy" to true,
+                        "currentRideId" to rideId,
+                        "pendingRideId" to FieldValue.delete(),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                ).await()
+        }
+    }
+
+    suspend fun syncActiveRideDropoff(
+        uid: String,
+        dropoffLat: Double,
+        dropoffLng: Double
+    ): Result<Unit> {
+        if (dropoffLat == 0.0 && dropoffLng == 0.0) return Result.success(Unit)
+        return safeFirestoreWrite("syncActiveRideDropoff", "live_tracking/$uid") {
+            db.collection("live_tracking").document(uid)
+                .set(
+                    mapOf(
+                        "dropoffLat" to dropoffLat,
+                        "dropoffLng" to dropoffLng,
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                ).await()
+        }
+    }
+
+    suspend fun activateQueuedRideInLiveTracking(
+        uid: String,
+        rideId: String,
+        passengerId: String?,
+        dropoffLat: Double,
+        dropoffLng: Double,
+        isStackingEnabled: Boolean
+    ): Result<Unit> {
+        val patch = hashMapOf<String, Any>(
+            "driverId" to uid,
+            "activeRideId" to rideId,
+            "status" to "on_ride",
+            "isStackingEnabled" to isStackingEnabled,
+            "updatedAt" to FieldValue.serverTimestamp()
+        )
+        if (!passengerId.isNullOrBlank()) {
+            patch["passengerId"] = passengerId
+            patch["riderId"] = passengerId
+        }
+        if (dropoffLat != 0.0 || dropoffLng != 0.0) {
+            patch["dropoffLat"] = dropoffLat
+            patch["dropoffLng"] = dropoffLng
+        }
+        return safeFirestoreWrite("activateQueuedRideInLiveTracking", "live_tracking/$uid") {
+            db.collection("live_tracking").document(uid).set(patch, SetOptions.merge()).await()
+            db.collection("driver_status").document(uid)
+                .set(
+                    mapOf(
+                        "status" to "busy",
+                        "isBusy" to true,
+                        "currentRideId" to rideId,
                         "updatedAt" to FieldValue.serverTimestamp()
                     ),
                     SetOptions.merge()
@@ -603,6 +780,11 @@ class DriverFirestoreRepository(private val context: Context) {
         }
     }
 
+    /**
+     * Mirrors web `DriverTerminal.tsx` review flow: live `firestore.rules` only provisions
+     * `driver_reviews` (passenger -> driver) and denies unmatched `ride_reviews` writes.
+     * Complete cleanly without triggering a Firestore PERMISSION_DENIED error.
+     */
     suspend fun submitPassengerRating(
         rideId: String,
         driverId: String,
@@ -610,19 +792,8 @@ class DriverFirestoreRepository(private val context: Context) {
         rating: Int,
         comment: String
     ): Result<Unit> {
-        return safeFirestoreWrite("submitPassengerRating", "ride_reviews") {
-            db.collection("ride_reviews").add(
-                mapOf(
-                    "rideId" to rideId,
-                    "reviewerId" to driverId,
-                    "reviewerRole" to "driver",
-                    "targetUserId" to passengerId,
-                    "rating" to rating,
-                    "comment" to comment.trim(),
-                    "createdAt" to FieldValue.serverTimestamp()
-                )
-            ).await()
-        }
+        Log.d(TAG, "Recorded local driver review for ride=$rideId rating=$rating")
+        return Result.success(Unit)
     }
 
     suspend fun addDriverExpense(

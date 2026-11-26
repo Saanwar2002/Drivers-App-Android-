@@ -105,9 +105,13 @@ class DriverLocationService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_UPDATE_STATE -> {
+                val previousOnRide = isOnRide
                 driverName = intent.getStringExtra(EXTRA_DRIVER_NAME) ?: driverName
                 isOnRide = intent.getBooleanExtra(EXTRA_IS_ON_RIDE, isOnRide)
                 updateNotification()
+                if (previousOnRide != isOnRide && locationCallback != null) {
+                    startLocationUpdates()
+                }
                 return START_STICKY
             }
             else -> {
@@ -199,9 +203,14 @@ class DriverLocationService : Service() {
 
         locationCallback?.let { fusedClient.removeLocationUpdates(it) }
 
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5_000L)
-            .setMinUpdateIntervalMillis(4_000L)
-            .setMinUpdateDistanceMeters(15f)
+        val intervalMs = if (isOnRide) 3_500L else 5_000L
+        val minIntervalMs = if (isOnRide) 2_500L else 4_000L
+        val minDistanceMeters = if (isOnRide) 8f else 15f
+        val writeThrottleMs = if (isOnRide) 3_500L else 4_500L
+
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, intervalMs)
+            .setMinUpdateIntervalMillis(minIntervalMs)
+            .setMinUpdateDistanceMeters(minDistanceMeters)
             .build()
 
         val callback = object : LocationCallback() {
@@ -217,7 +226,7 @@ class DriverLocationService : Service() {
                 UrgentPushEventBus.updateLocation(snapshot)
 
                 val now = System.currentTimeMillis()
-                if (now - lastWriteMs >= 4_500L) {
+                if (now - lastWriteMs >= writeThrottleMs) {
                     lastWriteMs = now
                     val uid = FirebaseProvider.auth().currentUser?.uid ?: return
                     serviceScope.launch {

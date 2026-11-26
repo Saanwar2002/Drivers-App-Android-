@@ -51,7 +51,10 @@ import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.StarOutline
 import androidx.compose.material.icons.rounded.Timer
 import androidx.compose.material.icons.rounded.Warning
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -492,17 +495,31 @@ fun ActiveTripSheetCard(
 
                 Spacer(Modifier.width(8.dp))
 
-                // Quick Chat & Call Buttons
+                // Quick Chat & Call Buttons (with unread badge on Chat button)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    IconButton(
-                        onClick = { viewModel.setChatSheetVisible(true) },
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(AnyRollerBgTertiary)
-                            .testTag("active_ride_chat_button")
+                    BadgedBox(
+                        badge = {
+                            if (state.unreadChatCount > 0) {
+                                Badge(
+                                    containerColor = AnyRollerRed,
+                                    contentColor = Color.White,
+                                    modifier = Modifier.testTag("active_ride_chat_unread_badge")
+                                ) {
+                                    Text(if (state.unreadChatCount > 9) "9+" else "${state.unreadChatCount}")
+                                }
+                            }
+                        }
                     ) {
-                        Icon(Icons.Rounded.ChatBubble, contentDescription = "Open Rider Chat", tint = AnyRollerGreen)
+                        IconButton(
+                            onClick = { viewModel.setChatSheetVisible(true) },
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(AnyRollerBgTertiary)
+                                .testTag("active_ride_chat_button")
+                        ) {
+                            Icon(Icons.Rounded.ChatBubble, contentDescription = "Open Rider Chat", tint = AnyRollerGreen)
+                        }
                     }
                     if (!ride.passengerPhone.isNullOrBlank()) {
                         IconButton(
@@ -1559,27 +1576,44 @@ fun RideChatModalSheet(
                     }
                 }
 
-                // Quick replies
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    listOf("I'm here", "On my way", "Stuck in traffic").forEach { quick ->
-                        Surface(
-                            onClick = { viewModel.sendChatMessage(quick) },
-                            shape = RoundedCornerShape(16.dp),
-                            color = AnyRollerBgSecondary,
-                            modifier = Modifier.border(1.dp, AnyRollerBorder, RoundedCornerShape(16.dp))
-                        ) {
-                            Text(
-                                text = quick,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = AnyRollerTextPrimary,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                            )
+                // 1-Tap Quick Replies (with 2-minute anti-spam cooldown mirroring DriverTerminal.tsx)
+                val quickCooldown = state.quickMessageCooldownSeconds
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        listOf("I'm outside", "On my way", "Stuck in traffic, 2 mins", "Where are you?").forEach { quick ->
+                            Surface(
+                                onClick = { viewModel.sendQuickChatMessage(quick) },
+                                enabled = quickCooldown == 0,
+                                shape = RoundedCornerShape(16.dp),
+                                color = if (quickCooldown == 0) AnyRollerBgSecondary else AnyRollerBgSecondary.copy(alpha = 0.45f),
+                                modifier = Modifier.border(
+                                    1.dp,
+                                    if (quickCooldown == 0) AnyRollerBorder else AnyRollerBorder.copy(alpha = 0.4f),
+                                    RoundedCornerShape(16.dp)
+                                )
+                            ) {
+                                Text(
+                                    text = quick,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (quickCooldown == 0) AnyRollerTextPrimary else AnyRollerTextMuted,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
                         }
+                    }
+                    if (quickCooldown > 0) {
+                        Text(
+                            text = "Quick replies ready again in ${quickCooldown}s (you can still type below)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = AnyRollerTextMuted,
+                            modifier = Modifier.padding(start = 14.dp, bottom = 4.dp)
+                        )
                     }
                 }
 

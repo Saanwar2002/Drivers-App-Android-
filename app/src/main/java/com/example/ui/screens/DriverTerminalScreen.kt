@@ -436,11 +436,14 @@ private fun TerminalMapCockpit(
                             icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_GREEN)
                         )
                     }
-                    if (ride.passengerLat != null && ride.passengerLng != null) {
+                    val livePassenger = state.passengerLiveLocation
+                    val pLat = livePassenger?.first ?: ride.passengerLat
+                    val pLng = livePassenger?.second ?: ride.passengerLng
+                    if (pLat != null && pLng != null && (pLat != 0.0 || pLng != 0.0)) {
                         Marker(
-                            state = MarkerState(position = LatLng(ride.passengerLat, ride.passengerLng)),
+                            state = MarkerState(position = LatLng(pLat, pLng)),
                             title = ride.passengerName,
-                            snippet = "Live passenger location",
+                            snippet = if (livePassenger != null) "Live passenger GPS" else "Passenger location",
                             icon = BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_AZURE)
                         )
                     }
