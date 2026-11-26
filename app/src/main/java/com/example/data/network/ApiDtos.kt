@@ -171,13 +171,22 @@ data class DemandZoneDto(
     val id: String? = null,
     val name: String? = null,
     val area: String? = null,
+    val label: String? = null,
     val lat: Double? = null,
     val lng: Double? = null,
+    val radius: Double? = null,
+    val radiusMeters: Double? = null,
     val level: String? = null,
     val intensity: String? = null,
     val multiplier: Double? = null,
+    val surgeMultiplier: Double? = null,
     val surgeFee: Double? = null,
-    val radiusMeters: Double? = null
+    val extraFee: Double? = null,
+    val isFixedModel: Boolean? = null,
+    val uiColor: String? = null,
+    val uiOpacity: Int? = null,
+    val maxWaitTimeMins: Double? = null,
+    val waitWarning: Boolean? = null
 )
 
 @Keep
@@ -233,7 +242,9 @@ data class RideTransitionRequest(
 @JsonClass(generateAdapter = true)
 data class CreateTripPaymentRequest(
     val rideId: String,
-    val paidWaitSeconds: Int? = null
+    val paidWaitSeconds: Int? = null,
+    val tipAmount: Double? = null,
+    val isAbandonment: Boolean? = null
 )
 
 @Keep
@@ -254,9 +265,27 @@ data class RideCompleteRequest(
     val action: String, // auto_card | qr_pending | qr_manual_close | cash_report | cash_finalize | abandonment
     val paidWaitSeconds: Int? = null,
     val cashCollected: Double? = null,
+    val forceComplete: Boolean? = null,
+    val forceCompleteReason: String? = null,
     val earlyCompletionReason: String? = null,
     val paymentUrl: String? = null,
     val abandonmentFee: Double? = null
+)
+
+@Keep
+@JsonClass(generateAdapter = true)
+data class CompleteRideResponse(
+    val success: Boolean = false,
+    val status: String? = null,
+    val awaitingCashConfirm: Boolean = false,
+    val unpaidBalance: Double? = null,
+    val finalFare: Double? = null,
+    val tipAmount: Double? = null,
+    val totalFarePaid: Double? = null,
+    val driverEarnings: Double? = null,
+    val platformFee: Double? = null,
+    val message: String? = null,
+    val error: String? = null
 )
 
 @Keep

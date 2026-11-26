@@ -84,7 +84,24 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     init {
         auth.addAuthStateListener(authListener)
         checkMaintenanceAndBootstrap()
+        observeGlobalMaintenanceRealtime()
         observeUrgentSessionEvents()
+    }
+
+    private fun observeGlobalMaintenanceRealtime() {
+        viewModelScope.launch {
+            repository.observeGlobalPlatformStatus().collect { status ->
+                if (status.maintenanceMode) {
+                    DriverLocationService.stop(context)
+                    _gateState.value = SessionGateState.Maintenance(
+                        status.maintenanceMessage?.takeIf { it.isNotBlank() }
+                            ?: "AnyRoller is currently undergoing scheduled maintenance. Please check back shortly."
+                    )
+                } else if (_gateState.value is SessionGateState.Maintenance) {
+                    handleAuthUserChanged(auth.currentUser)
+                }
+            }
+        }
     }
 
     private fun observeUrgentSessionEvents() {

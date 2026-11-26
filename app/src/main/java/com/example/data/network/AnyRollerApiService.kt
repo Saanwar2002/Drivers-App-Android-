@@ -100,7 +100,7 @@ interface AnyRollerApiService {
     suspend fun createTripPayment(@Body body: CreateTripPaymentRequest): Response<CreateTripPaymentResponse>
 
     @POST("/api/rides/complete")
-    suspend fun completeRide(@Body body: RideCompleteRequest): Response<GenericSuccessResponse>
+    suspend fun completeRide(@Body body: RideCompleteRequest): Response<CompleteRideResponse>
 
     @POST("/api/rides/cancel")
     suspend fun cancelRide(@Body body: RideCancelRequest): Response<GenericSuccessResponse>

@@ -4,7 +4,11 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.PowerManager
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.Settings
 import android.widget.Toast
 import androidx.browser.customtabs.CustomTabColorSchemeParams
@@ -44,16 +48,20 @@ object ExternalIntentHelpers {
 
     /**
      * One-tap turn-by-turn external navigation respecting driver's `defaultNavApp` preference
-     * (`"Google Maps"` or `"Waze"`), with graceful fallback.
+     * (`"Google Maps"` or `"Waze"`), with multi-stop Google Maps waypoints support and fallback.
      */
     fun launchTurnByTurnNavigation(
         context: Context,
         lat: Double,
         lng: Double,
-        preferredNavApp: String
+        preferredNavApp: String,
+        waypoints: List<Pair<Double, Double>> = emptyList()
     ) {
+        val validWaypoints = waypoints.filter { (wLat, wLng) -> wLat != 0.0 || wLng != 0.0 }
         if (preferredNavApp.equals("Waze", ignoreCase = true)) {
-            val wazeUri = Uri.parse("https://waze.com/ul?ll=$lat,$lng&navigate=yes")
+            val targetLat = validWaypoints.firstOrNull()?.first ?: lat
+            val targetLng = validWaypoints.firstOrNull()?.second ?: lng
+            val wazeUri = Uri.parse("https://waze.com/ul?ll=$targetLat,$targetLng&navigate=yes")
             val wazeIntent = Intent(Intent.ACTION_VIEW, wazeUri).apply {
                 setPackage("com.waze")
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -62,7 +70,23 @@ object ExternalIntentHelpers {
                 context.startActivity(wazeIntent)
                 return
             } catch (_: ActivityNotFoundException) {
-                // Fall back to Google Maps or web Waze
+                // Fall back to Google Maps
+            }
+        }
+
+        if (validWaypoints.isNotEmpty()) {
+            val wpStr = validWaypoints.joinToString("|") { (wLat, wLng) -> "$wLat,$wLng" }
+            val dirUrl = "https://www.google.com/maps/dir/?api=1&destination=$lat,$lng&waypoints=${Uri.encode(wpStr)}&travelmode=driving&dir_action=navigate"
+            val dirIntent = Intent(Intent.ACTION_VIEW, Uri.parse(dirUrl)).apply {
+                setPackage("com.google.android.apps.maps")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            try {
+                context.startActivity(dirIntent)
+                return
+            } catch (_: ActivityNotFoundException) {
+                openCustomTab(context, dirUrl)
+                return
             }
         }
 
@@ -75,6 +99,29 @@ object ExternalIntentHelpers {
             context.startActivity(gmapsIntent)
         } catch (_: ActivityNotFoundException) {
             openCustomTab(context, "https://www.google.com/maps/dir/?api=1&destination=$lat,$lng&travelmode=driving")
+        }
+    }
+
+    /**
+     * Triggers subtle haptic feedback patterns for offers, mid-trip updates, arrival, and cancellations.
+     */
+    fun vibratePattern(context: Context, timings: LongArray) {
+        runCatching {
+            val vibrator: Vibrator? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vm = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+                vm?.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            }
+            if (vibrator?.hasVibrator() == true) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator.vibrate(VibrationEffect.createWaveform(timings, -1))
+                } else {
+                    @Suppress("DEPRECATION")
+                    vibrator.vibrate(timings, -1)
+                }
+            }
         }
     }
 

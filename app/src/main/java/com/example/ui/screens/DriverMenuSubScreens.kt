@@ -421,7 +421,14 @@ fun DriverZonesScreen(
                                 Text(zone.name, style = MaterialTheme.typography.titleSmall, color = AnyRollerTextPrimary)
                                 Text("Demand: ${zone.level.uppercase()}", style = MaterialTheme.typography.labelSmall, color = AnyRollerOrange)
                             }
-                            Text("%.1fx".format(zone.multiplier), style = MaterialTheme.typography.titleMedium, fontFamily = JetBrainsMonoFont, color = AnyRollerGreen)
+                            Text(
+                                text = zone.label.ifBlank {
+                                    if (zone.isFixedModel) "+£%.2f".format(zone.surgeFee) else "%.1fx".format(zone.multiplier)
+                                },
+                                style = MaterialTheme.typography.titleMedium,
+                                fontFamily = JetBrainsMonoFont,
+                                color = AnyRollerGreen
+                            )
                         }
                     }
                 }

@@ -12,13 +12,17 @@ import com.example.data.model.DriverMetrics
 import com.example.data.model.DriverNotification
 import com.example.data.model.DriverProfile
 import com.example.data.model.EarningsGoals
+import com.example.data.model.GlobalPlatformStatus
+import com.example.data.model.GlobalTiersConfig
 import com.example.data.model.InsurancePartner
 import com.example.data.model.RidePlatformConfig
 import com.example.data.model.RideRequest
 import com.example.data.model.RideStop
 import com.example.data.model.RoadHazard
 import com.example.data.model.SurgeRules
+import com.example.data.model.VehicleTypeConfig
 import com.example.data.model.VerificationDoc
+import com.example.data.model.defaultVehicleTypes
 import com.example.data.model.defaultWeeklySchedule
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.DocumentSnapshot
@@ -96,6 +100,74 @@ class DriverFirestoreRepository(private val context: Context) {
         awaitClose { reg.remove() }
     }
 
+    @Suppress("UNCHECKED_CAST")
+    fun observeGlobalTiersConfig(): Flow<GlobalTiersConfig> = callbackFlow {
+        val reg = db.collection("platform_config").document("global_tiers")
+            .addSnapshotListener { snap, error ->
+                if (error != null) {
+                    logError("observeGlobalTiersConfig", "platform_config/global_tiers", error)
+                    return@addSnapshotListener
+                }
+                if (snap == null || !snap.exists()) {
+                    trySend(GlobalTiersConfig())
+                    return@addSnapshotListener
+                }
+                val models = snap.get("providerModels") as? Map<String, Any?>
+                val transport = models?.get("on_demand_transport") as? Map<String, Any?>
+                val tiers = transport?.get("tiers") as? Map<String, Any?>
+                val std = tiers?.get("STANDARD") as? Map<String, Any?>
+                val gold = (tiers?.get("GOLD") ?: tiers?.get("DRIVER_GOLD") ?: tiers?.get("PRO")) as? Map<String, Any?>
+
+                fun parseRate(raw: Any?): Double? {
+                    val v = (raw as? Number)?.toDouble() ?: return null
+                    return if (v > 1.0) v / 100.0 else v
+                }
+
+                trySend(
+                    GlobalTiersConfig(
+                        standardCommissionRate = parseRate(std?.get("commission") ?: std?.get("commissionRate")),
+                        standardFixedTripFee = (std?.get("fixedTripFee") as? Number)?.toDouble(),
+                        goldCommissionRate = parseRate(gold?.get("commission") ?: gold?.get("commissionRate")),
+                        goldFixedTripFee = (gold?.get("fixedTripFee") as? Number)?.toDouble()
+                    )
+                )
+            }
+        awaitClose { reg.remove() }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    fun observeGlobalPlatformStatus(): Flow<GlobalPlatformStatus> = callbackFlow {
+        val reg = db.collection("platform_config").document("global")
+            .addSnapshotListener { snap, error ->
+                if (error != null) {
+                    logError("observeGlobalPlatformStatus", "platform_config/global", error)
+                    return@addSnapshotListener
+                }
+                if (snap == null || !snap.exists()) {
+                    trySend(GlobalPlatformStatus())
+                    return@addSnapshotListener
+                }
+                val maint = snap.getBoolean("maintenanceMode") ?: false
+                val sched = snap.get("scheduledMaintenance") as? Map<String, Any?>
+                val msg = snap.getString("maintenanceMessage")
+                    ?: sched?.get("message")?.toString()
+                val taxiMode = snap.getString("taxiPortalMode")?.lowercase() ?: ""
+                val taxiComingSoon = taxiMode == "coming_soon" ||
+                    (snap.getBoolean("taxiComingSoon") ?: false) ||
+                    snap.get("showBookTaxiButton")?.toString() == "coming_soon"
+                trySend(
+                    GlobalPlatformStatus(
+                        maintenanceMode = maint,
+                        maintenanceMessage = msg,
+                        taxiComingSoon = taxiComingSoon,
+                        taxiComingSoonTitle = snap.getString("taxiComingSoonTitle"),
+                        taxiComingSoonMessage = snap.getString("taxiComingSoonMessage")
+                    )
+                )
+            }
+        awaitClose { reg.remove() }
+    }
+
     fun observeDriverMetrics(uid: String): Flow<DriverMetrics> = callbackFlow {
         val reg = db.collection("driver_metrics").document(uid)
             .addSnapshotListener { snap, error ->
@@ -112,7 +184,8 @@ class DriverFirestoreRepository(private val context: Context) {
                     onlineSecondsToday = snap.getLong("onlineSecondsToday")
                         ?: snap.getLong("onlineSeconds") ?: 0L,
                     ridesToday = (snap.getLong("ridesToday") ?: 0L).toInt(),
-                    earningsToday = snap.getDouble("earningsToday") ?: 0.0,
+                    earningsToday = snap.getDouble("dailyEarnings")
+                        ?: snap.getDouble("earningsToday") ?: 0.0,
                     lifetimeRides = (snap.getLong("lifetimeRides") ?: snap.getLong("totalRides") ?: 0L).toInt(),
                     lifetimeEarnings = snap.getDouble("lifetimeEarnings") ?: 0.0,
                     acceptanceRate = snap.getDouble("acceptanceRate") ?: 95.0,
@@ -125,11 +198,11 @@ class DriverFirestoreRepository(private val context: Context) {
 
     fun observePendingRideOffers(): Flow<List<RideRequest>> = callbackFlow {
         val reg = db.collection("ride_requests")
-            .whereEqualTo("status", "pending")
-            .limit(20)
+            .whereIn("status", listOf("offered", "pending"))
+            .limit(25)
             .addSnapshotListener { snap, error ->
                 if (error != null) {
-                    logError("observePendingRideOffers", "ride_requests(pending)", error)
+                    logError("observePendingRideOffers", "ride_requests(offered/pending)", error)
                     return@addSnapshotListener
                 }
                 val offers = snap?.documents.orEmpty()
@@ -330,7 +403,16 @@ class DriverFirestoreRepository(private val context: Context) {
         driverName: String,
         vehicleCategory: String,
         vehicleCategories: List<String>,
-        isPetFriendly: Boolean
+        isPetFriendly: Boolean,
+        isStackingEnabled: Boolean? = null,
+        isLastJob: Boolean? = null,
+        destinationModeActive: Boolean? = null,
+        homeLat: Double? = null,
+        homeLng: Double? = null,
+        zoneEnabled: Boolean? = null,
+        zoneMaxDistance: Double? = null,
+        dropoffLat: Double? = null,
+        dropoffLng: Double? = null
     ): Result<Unit> {
         val payload = hashMapOf<String, Any>(
             "driverId" to uid,
@@ -348,6 +430,17 @@ class DriverFirestoreRepository(private val context: Context) {
         if (!isOnRide) {
             payload["status"] = if (isOnline) "available" else "offline"
         }
+        isStackingEnabled?.let { payload["isStackingEnabled"] = it }
+        isLastJob?.let { payload["isLastJob"] = it }
+        destinationModeActive?.let { payload["destinationModeActive"] = it }
+        homeLat?.let { payload["homeLat"] = it }
+        homeLng?.let { payload["homeLng"] = it }
+        zoneEnabled?.let { payload["zoneEnabled"] = it }
+        zoneMaxDistance?.let { payload["zoneMaxDistance"] = it }
+        if (dropoffLat != null && dropoffLng != null && (dropoffLat != 0.0 || dropoffLng != 0.0)) {
+            payload["dropoffLat"] = dropoffLat
+            payload["dropoffLng"] = dropoffLng
+        }
         return safeFirestoreWrite("mergeLiveTracking", "live_tracking/$uid") {
             db.collection("live_tracking").document(uid)
                 .set(payload, SetOptions.merge()).await()
@@ -355,7 +448,9 @@ class DriverFirestoreRepository(private val context: Context) {
                 .set(
                     mapOf(
                         "driverId" to uid,
+                        "online" to isOnline,
                         "isOnline" to isOnline,
+                        "isBusy" to isOnRide,
                         "status" to if (!isOnline) "offline" else if (isOnRide) "on_ride" else "online",
                         "lat" to lat,
                         "lng" to lng,
@@ -363,6 +458,62 @@ class DriverFirestoreRepository(private val context: Context) {
                     ),
                     SetOptions.merge()
                 ).await()
+        }
+    }
+
+    suspend fun recordDriverDeclineStatus(uid: String): Result<Unit> {
+        return safeFirestoreWrite("recordDriverDeclineStatus", "driver_status/$uid") {
+            db.collection("driver_status").document(uid)
+                .set(
+                    mapOf(
+                        "pendingRideId" to FieldValue.delete(),
+                        "consecutiveDeclines" to FieldValue.increment(1L),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                ).await()
+        }
+    }
+
+    suspend fun markDriverIdleStatus(uid: String): Result<Unit> {
+        return safeFirestoreWrite("markDriverIdleStatus", "driver_status/$uid") {
+            db.collection("driver_status").document(uid)
+                .set(
+                    mapOf(
+                        "isBusy" to false,
+                        "currentRideId" to FieldValue.delete(),
+                        "pendingRideId" to FieldValue.delete(),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                ).await()
+        }
+    }
+
+    suspend fun syncLiveTrackingDispatchPrefs(
+        uid: String,
+        isStackingEnabled: Boolean,
+        isLastJob: Boolean,
+        destinationModeActive: Boolean,
+        homeLat: Double?,
+        homeLng: Double?,
+        zoneEnabled: Boolean,
+        zoneMaxDistance: Double
+    ): Result<Unit> {
+        val patch = hashMapOf<String, Any>(
+            "isStackingEnabled" to isStackingEnabled,
+            "isLastJob" to isLastJob,
+            "destinationModeActive" to destinationModeActive,
+            "zoneEnabled" to zoneEnabled,
+            "zoneMaxDistance" to zoneMaxDistance,
+            "updatedAt" to FieldValue.serverTimestamp()
+        )
+        if (homeLat != null && homeLng != null) {
+            patch["homeLat"] = homeLat
+            patch["homeLng"] = homeLng
+        }
+        return safeFirestoreWrite("syncLiveTrackingDispatchPrefs", "live_tracking/$uid") {
+            db.collection("live_tracking").document(uid).set(patch, SetOptions.merge()).await()
         }
     }
 
@@ -727,10 +878,13 @@ class DriverFirestoreRepository(private val context: Context) {
 
         val rawStops = (doc.get("stops") as? List<Map<String, Any?>>).orEmpty()
         val stops = rawStops.map { s ->
+            val coords = s["coords"] as? Map<String, Any?>
             RideStop(
                 address = s["address"]?.toString() ?: "",
-                lat = (s["lat"] as? Number)?.toDouble() ?: 0.0,
-                lng = (s["lng"] as? Number)?.toDouble() ?: 0.0
+                lat = (coords?.get("lat") as? Number)?.toDouble()
+                    ?: (s["lat"] as? Number)?.toDouble() ?: 0.0,
+                lng = (coords?.get("lng") as? Number)?.toDouble()
+                    ?: (s["lng"] as? Number)?.toDouble() ?: 0.0
             )
         }
 
@@ -739,22 +893,39 @@ class DriverFirestoreRepository(private val context: Context) {
         val completedTs = doc.getTimestamp("completedAt", DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)?.toDate()?.time
             ?: doc.getLong("completedAtMs") ?: 0L
 
+        val parsedOfferExpiresMs: Long = run {
+            val rawExp = doc.get("offerExpiresAt")
+            when (rawExp) {
+                is Timestamp -> rawExp.toDate().time
+                is Number -> rawExp.toLong()
+                is String -> runCatching { java.time.Instant.parse(rawExp).toEpochMilli() }.getOrNull()
+                else -> null
+            }
+        } ?: doc.getLong("expiresAtMs") ?: (createdTs + 15_000L)
+
+        val pickupString = doc.getString("pickupAddress")
+            ?: (doc.get("pickup") as? String)?.takeIf { it.isNotBlank() }
+            ?: pickupMap?.get("address")?.toString()
+            ?: "Pickup location"
+        val dropoffString = doc.getString("dropoffAddress")
+            ?: (doc.get("dropoff") as? String)?.takeIf { it.isNotBlank() }
+            ?: dropoffMap?.get("address")?.toString()
+            ?: "Dropoff location"
+
         return RideRequest(
             id = doc.id,
             status = doc.getString("status") ?: "pending",
-            passengerId = doc.getString("passengerId") ?: doc.getString("riderId") ?: "",
+            passengerId = doc.getString("passengerId") ?: doc.getString("riderId") ?: doc.getString("userId") ?: "",
             passengerName = doc.getString("passengerName") ?: doc.getString("riderName") ?: "Passenger",
             passengerRating = doc.getDouble("passengerRating") ?: 4.9,
             passengerPhone = doc.getString("passengerPhone"),
-            riderNotes = doc.getString("riderNotes") ?: doc.getString("notes"),
+            riderNotes = doc.getString("riderNotes") ?: doc.getString("comments") ?: doc.getString("instructions") ?: doc.getString("notes"),
             driverId = doc.getString("driverId"),
             assignedDriverId = doc.getString("assignedDriverId"),
-            pickupAddress = doc.getString("pickupAddress")
-                ?: pickupMap?.get("address")?.toString() ?: "Pickup location",
+            pickupAddress = pickupString,
             pickupLat = pickupLat,
             pickupLng = pickupLng,
-            dropoffAddress = doc.getString("dropoffAddress")
-                ?: dropoffMap?.get("address")?.toString() ?: "Dropoff location",
+            dropoffAddress = dropoffString,
             dropoffLat = dropoffLat,
             dropoffLng = dropoffLng,
             passengerLat = doc.getDouble("passengerLat")
@@ -764,11 +935,14 @@ class DriverFirestoreRepository(private val context: Context) {
             stops = stops,
             currentStopIndex = (doc.getLong("currentStopIndex") ?: 0L).toInt(),
             fareEstimate = doc.getDouble("fareEstimate")
+                ?: doc.getDouble("totalFare")
                 ?: doc.getDouble("price")
                 ?: doc.getDouble("quotedPrice") ?: 0.0,
             price = doc.getDouble("price"),
             quotedPrice = doc.getDouble("quotedPrice"),
             surgeMultiplier = doc.getDouble("surgeMultiplier") ?: 1.0,
+            surgeModel = doc.getString("surgeModel") ?: "multiplier",
+            surgeFixedAmount = doc.getDouble("surgeFixedAmount") ?: doc.getDouble("surgeFixed") ?: 0.0,
             vehicleCategory = doc.getString("vehicleCategory") ?: "standard",
             distanceMiles = doc.getDouble("distanceMiles") ?: doc.getDouble("distance") ?: 0.0,
             durationMinutes = (doc.getLong("durationMinutes") ?: doc.getLong("etaMinutes") ?: 0L).toInt(),
@@ -795,7 +969,12 @@ class DriverFirestoreRepository(private val context: Context) {
             completedAtMs = completedTs,
             scheduledTime = doc.getString("scheduledTime"),
             offeredAtMs = doc.getLong("offeredAtMs") ?: createdTs,
-            expiresAtMs = doc.getLong("expiresAtMs") ?: (createdTs + 15_000L)
+            expiresAtMs = parsedOfferExpiresMs,
+            isModifiedByPassenger = doc.getBoolean("isModifiedByPassenger") ?: false,
+            cancelledBy = doc.getString("cancelledBy"),
+            cancellationFee = doc.getDouble("cancellationFee") ?: 0.0,
+            cashCollected = doc.getDouble("cashCollected"),
+            unpaidBalance = doc.getDouble("unpaidBalance") ?: 0.0
         )
     }
 
@@ -812,15 +991,51 @@ class DriverFirestoreRepository(private val context: Context) {
             highFee = (surgeMap?.get("highFee") as? Number)?.toDouble() ?: 3.5,
             lowMultiplier = (surgeMap?.get("lowMultiplier") as? Number)?.toDouble() ?: 1.1,
             mediumMultiplier = (surgeMap?.get("mediumMultiplier") as? Number)?.toDouble() ?: 1.3,
-            highMultiplier = (surgeMap?.get("highMultiplier") as? Number)?.toDouble() ?: 1.6
+            highMultiplier = (surgeMap?.get("highMultiplier") as? Number)?.toDouble() ?: 1.6,
+            lowColor = surgeMap?.get("lowColor")?.toString() ?: "green",
+            mediumColor = surgeMap?.get("mediumColor")?.toString() ?: "amber",
+            highColor = surgeMap?.get("highColor")?.toString() ?: "red",
+            surgeOpacity = (surgeMap?.get("surgeOpacity") as? Number)?.toInt() ?: 40
         )
+
+        val rawCommissionRate = doc.getDouble("commissionRate")
+            ?: doc.getDouble("commission")?.let { if (it > 1.0) it / 100.0 else it }
+            ?: 0.12
+
+        val rawGoldRate = doc.getDouble("goldCommissionRate")
+            ?: doc.getDouble("goldCommission")?.let { if (it > 1.0) it / 100.0 else it }
+            ?: 0.10
+
+        val rawVehicleTypes = (doc.get("vehicleTypes") as? List<Map<String, Any?>>).orEmpty()
+        val parsedVehicleTypes = rawVehicleTypes.mapNotNull { m ->
+            val id = m["id"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val name = m["name"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: id.replaceFirstChar { it.uppercase() }
+            val mult = (m["multiplier"] as? Number)?.toDouble() ?: 1.0
+            VehicleTypeConfig(id = id, name = name, multiplier = mult)
+        }.ifEmpty { defaultVehicleTypes() }
+
         return RidePlatformConfig(
-            commissionRate = doc.getDouble("commissionRate") ?: 0.12,
-            goldCommissionRate = doc.getDouble("goldCommissionRate") ?: 0.10,
+            baseFare = doc.getDouble("baseFare") ?: 2.5,
+            distanceRate = doc.getDouble("distanceRate") ?: 1.2,
+            timeRate = doc.getDouble("timeRate") ?: 0.15,
+            waitRatePerMinute = doc.getDouble("waitRatePerMinute") ?: 0.25,
+            minFare = doc.getDouble("minFare") ?: 5.0,
+            priorityFee = doc.getDouble("priorityFee") ?: 3.0,
+            commissionRate = rawCommissionRate,
+            goldCommissionRate = rawGoldRate,
             fixedTripFee = doc.getDouble("fixedTripFee") ?: 0.0,
             maxDailyDriverHours = doc.getDouble("maxDailyDriverHours") ?: 10.0,
             freeWaitSeconds = (doc.getLong("freeWaitSeconds") ?: 180L).toInt(),
-            surgeRules = surge
+            dispatchRadiusMiles = doc.getDouble("dispatchRadiusMiles") ?: 15.0,
+            dispatchTimeoutSeconds = (doc.getLong("dispatchTimeoutSeconds") ?: 15L).toInt().coerceIn(5, 60),
+            autoDispatchEnabled = doc.getBoolean("autoDispatchEnabled") ?: true,
+            allowRiderAbandonment = doc.getBoolean("allowRiderAbandonment") ?: false,
+            surgeEnabled = doc.getBoolean("surgeEnabled") ?: true,
+            surgeModel = doc.getString("surgeModel") ?: "fixed",
+            surgeFixedAmount = doc.getDouble("surgeFixedAmount") ?: 2.0,
+            surgeMultiplierValue = doc.getDouble("surgeMultiplierValue") ?: 1.4,
+            surgeRules = surge,
+            vehicleTypes = parsedVehicleTypes
         )
     }
 }

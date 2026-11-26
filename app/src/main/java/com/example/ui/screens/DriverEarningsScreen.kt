@@ -30,8 +30,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.AccountBalance
+import android.widget.Toast
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.FileDownload
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.ReceiptLong
 import androidx.compose.material.icons.rounded.Refresh
@@ -63,12 +65,14 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.example.data.model.FallbackFareConfig
 import com.example.data.model.resolveRideFinancialSummary
+import com.example.service.CsvExportHelper
 import com.example.ui.theme.AnyRollerBgInput
 import com.example.ui.theme.AnyRollerBgPrimary
 import com.example.ui.theme.AnyRollerBgSecondary
@@ -96,6 +100,7 @@ fun DriverEarningsScreen(
     state: DriverTerminalUiState,
     viewModel: DriverTerminalViewModel
 ) {
+    val context = LocalContext.current
     var periodIndex by remember { mutableIntStateOf(0) } // 0=Today, 1=Week, 2=Month
     var showGoalsDialog by remember { mutableStateOf(false) }
 
@@ -488,6 +493,45 @@ fun DriverEarningsScreen(
             }
         }
 
+        // Gold Driver HMRC Tax-Ready CSV Export
+        OutlinedButton(
+            onClick = {
+                if (state.profile.isGoldDriver) {
+                    CsvExportHelper.shareTripsCsv(
+                        context = context,
+                        rides = state.completedRides,
+                        commissionRate = state.activeCommissionRate,
+                        fixedTripFee = state.platformConfig.fixedTripFee
+                    )
+                } else {
+                    Toast.makeText(context, "HMRC CSV export is included with Gold Driver.", Toast.LENGTH_SHORT).show()
+                    viewModel.launchGoldDriverUpgrade()
+                }
+            },
+            shape = RoundedCornerShape(14.dp),
+            border = androidx.compose.foundation.BorderStroke(
+                1.dp,
+                if (state.profile.isGoldDriver) AnyRollerGreen else AnyRollerOrange.copy(alpha = 0.6f)
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp)
+                .testTag("export_earnings_csv_button")
+        ) {
+            Icon(
+                Icons.Rounded.FileDownload,
+                contentDescription = null,
+                tint = if (state.profile.isGoldDriver) AnyRollerGreen else AnyRollerOrange,
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = if (state.profile.isGoldDriver) "Export Trips CSV (HMRC)" else "Export Trips CSV (Gold Feature)",
+                color = if (state.profile.isGoldDriver) AnyRollerGreen else AnyRollerOrange,
+                fontWeight = FontWeight.Bold
+            )
+        }
+
         Spacer(Modifier.height(16.dp))
     }
 
@@ -548,6 +592,7 @@ fun DriverExpensesScreen(
     viewModel: DriverTerminalViewModel,
     onBack: () -> Unit
 ) {
+    val context = LocalContext.current
     var amount by remember { mutableStateOf("") }
     var category by remember { mutableStateOf("Fuel") }
     var notes by remember { mutableStateOf("") }
@@ -662,9 +707,39 @@ fun DriverExpensesScreen(
             }
 
             item {
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("Logged Expenses", style = MaterialTheme.typography.titleSmall, color = AnyRollerTextPrimary)
-                    Text("Total: £%.2f".format(totalLogged), style = MaterialTheme.typography.titleSmall, fontFamily = JetBrainsMonoFont, color = AnyRollerOrange)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text("Logged Expenses", style = MaterialTheme.typography.titleSmall, color = AnyRollerTextPrimary)
+                        Text("Total: £%.2f".format(totalLogged), style = MaterialTheme.typography.labelMedium, fontFamily = JetBrainsMonoFont, color = AnyRollerOrange)
+                    }
+                    TextButton(
+                        onClick = {
+                            if (state.profile.isGoldDriver) {
+                                CsvExportHelper.shareExpensesCsv(context, state.expenses)
+                            } else {
+                                Toast.makeText(context, "HMRC Expense CSV export is included with Gold Driver.", Toast.LENGTH_SHORT).show()
+                                viewModel.launchGoldDriverUpgrade()
+                            }
+                        },
+                        modifier = Modifier.testTag("export_expenses_csv_button")
+                    ) {
+                        Icon(
+                            Icons.Rounded.FileDownload,
+                            contentDescription = "Export Expenses CSV",
+                            tint = if (state.profile.isGoldDriver) AnyRollerGreen else AnyRollerOrange,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            text = if (state.profile.isGoldDriver) "Export CSV" else "CSV (Gold)",
+                            color = if (state.profile.isGoldDriver) AnyRollerGreen else AnyRollerOrange,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
             }
 
@@ -707,8 +782,10 @@ fun DriverExpensesScreen(
 @Composable
 fun DriverTripHistoryScreen(
     state: DriverTerminalUiState,
+    viewModel: DriverTerminalViewModel,
     onBack: () -> Unit
 ) {
+    val context = LocalContext.current
     val dateFmt = remember { SimpleDateFormat("dd MMM, HH:mm", Locale.UK) }
     Column(
         modifier = Modifier
@@ -717,7 +794,45 @@ fun DriverTripHistoryScreen(
             .statusBarsPadding()
             .navigationBarsPadding()
     ) {
-        SubScreenTopBar(title = "Completed Trip History", onBack = onBack)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(end = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(modifier = Modifier.weight(1f)) {
+                SubScreenTopBar(title = "Completed Trip History", onBack = onBack)
+            }
+            TextButton(
+                onClick = {
+                    if (state.profile.isGoldDriver) {
+                        CsvExportHelper.shareTripsCsv(
+                            context = context,
+                            rides = state.completedRides,
+                            commissionRate = state.activeCommissionRate,
+                            fixedTripFee = state.platformConfig.fixedTripFee
+                        )
+                    } else {
+                        Toast.makeText(context, "HMRC Trip CSV export is included with Gold Driver.", Toast.LENGTH_SHORT).show()
+                        viewModel.launchGoldDriverUpgrade()
+                    }
+                },
+                modifier = Modifier.testTag("export_history_csv_button")
+            ) {
+                Icon(
+                    Icons.Rounded.FileDownload,
+                    contentDescription = "Export Trips CSV",
+                    tint = if (state.profile.isGoldDriver) AnyRollerGreen else AnyRollerOrange,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    text = if (state.profile.isGoldDriver) "CSV" else "Gold CSV",
+                    color = if (state.profile.isGoldDriver) AnyRollerGreen else AnyRollerOrange,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
 
         if (state.completedRides.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

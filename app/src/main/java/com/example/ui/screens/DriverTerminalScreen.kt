@@ -1,9 +1,11 @@
 package com.example.ui.screens
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.BatteryManager
+import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -63,6 +65,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -116,6 +119,7 @@ import com.google.maps.android.compose.MapProperties
 import com.google.maps.android.compose.MapUiSettings
 import com.google.maps.android.compose.Marker
 import com.google.maps.android.compose.MarkerState
+import com.google.maps.android.compose.Polyline
 import com.google.maps.android.compose.rememberCameraPositionState
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -130,6 +134,20 @@ fun DriverTerminalRoot(
 ) {
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
+
+    // Keep screen awake while driver is Online or on an active trip
+    val keepScreenAwake = state.isOnline || state.activeRide != null
+    DisposableEffect(context, keepScreenAwake) {
+        val window = (context as? Activity)?.window
+        if (keepScreenAwake) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
 
     LaunchedEffect(state.toastMessage) {
         val msg = state.toastMessage
@@ -246,6 +264,7 @@ fun DriverTerminalRoot(
                 DriverOverlayRoute.MENU -> DriverMenuScreen(
                     state = state,
                     viewModel = viewModel,
+                    onToggleOnline = onToggleOnlineClicked,
                     onClose = { viewModel.closeOverlay() },
                     onSignOut = onSignOut
                 )
@@ -288,6 +307,7 @@ fun DriverTerminalRoot(
                 )
                 DriverOverlayRoute.TRIP_HISTORY -> DriverTripHistoryScreen(
                     state = state,
+                    viewModel = viewModel,
                     onBack = { viewModel.closeOverlay() }
                 )
             }
@@ -338,6 +358,16 @@ private fun TerminalMapCockpit(
         }
     }
 
+    // Smooth street-level zoom (18f) when approaching within 200m of pickup or marking arrived
+    LaunchedEffect(state.pickupZoomEventId) {
+        val ride = state.activeRide
+        if (state.pickupZoomEventId > 0L && ride != null && (ride.pickupLat != 0.0 || ride.pickupLng != 0.0)) {
+            cameraPositionState.animate(
+                CameraUpdateFactory.newLatLngZoom(LatLng(ride.pickupLat, ride.pickupLng), 18f)
+            )
+        }
+    }
+
     val darkMapStyle = remember { MapStyleOptions(ANYROLLER_DARK_MAP_STYLE_JSON) }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -359,25 +389,29 @@ private fun TerminalMapCockpit(
                 mapToolbarEnabled = false
             )
         ) {
-            // Demand Zones
-            state.demandZones.forEach { zone ->
-                val fill = when (zone.level) {
-                    "high" -> AnyRollerRed.copy(alpha = 0.22f)
-                    "moderate" -> AnyRollerOrange.copy(alpha = 0.20f)
-                    else -> AnyRollerGreen.copy(alpha = 0.16f)
+            // Demand Zones (live Admin surgeRules colors, opacity, and fixed/multiplier zones)
+            if (state.platformConfig.surgeEnabled) {
+                state.demandZones.forEach { zone ->
+                    val baseColor = when (zone.uiColor.lowercase()) {
+                        "red" -> AnyRollerRed
+                        "amber", "orange", "yellow" -> AnyRollerOrange
+                        "blue" -> AnyRollerBlue
+                        "green" -> AnyRollerGreen
+                        else -> when (zone.level) {
+                            "high" -> AnyRollerRed
+                            "medium", "moderate" -> AnyRollerOrange
+                            else -> AnyRollerGreen
+                        }
+                    }
+                    val fillAlpha = (zone.uiOpacity.coerceIn(10, 90) / 100f) * 0.65f
+                    Circle(
+                        center = LatLng(zone.lat, zone.lng),
+                        radius = zone.radiusMeters,
+                        fillColor = baseColor.copy(alpha = fillAlpha),
+                        strokeColor = baseColor.copy(alpha = 0.75f),
+                        strokeWidth = 2f
+                    )
                 }
-                val stroke = when (zone.level) {
-                    "high" -> AnyRollerRed.copy(alpha = 0.65f)
-                    "moderate" -> AnyRollerOrange.copy(alpha = 0.65f)
-                    else -> AnyRollerGreen.copy(alpha = 0.55f)
-                }
-                Circle(
-                    center = LatLng(zone.lat, zone.lng),
-                    radius = zone.radiusMeters,
-                    fillColor = fill,
-                    strokeColor = stroke,
-                    strokeWidth = 2f
-                )
             }
 
             // Road Hazards
@@ -430,6 +464,14 @@ private fun TerminalMapCockpit(
                         )
                     }
                 }
+                // Live Active Route Polyline (clean single stroke, zero map clutter)
+                if (state.activeRoute.points.size >= 2) {
+                    Polyline(
+                        points = state.activeRoute.points,
+                        color = if (state.rideState == TerminalRideState.IN_PROGRESS) AnyRollerGreen else AnyRollerBlue,
+                        width = 12f
+                    )
+                }
             }
         }
 
@@ -443,7 +485,10 @@ private fun TerminalMapCockpit(
             val navHeading = when (state.rideState) {
                 TerminalRideState.EN_ROUTE_PICKUP -> "HEAD TO PICKUP"
                 TerminalRideState.WAITING -> "WAITING AT PICKUP"
-                else -> "HEAD TO DROPOFF"
+                else -> {
+                    val hasStop = state.activeRide.currentStopIndex < state.activeRide.stops.size
+                    if (hasStop) "HEAD TO STOP ${state.activeRide.currentStopIndex + 1}" else "HEAD TO DROPOFF"
+                }
             }
             val targetAddress = when (state.rideState) {
                 TerminalRideState.IN_PROGRESS -> {
@@ -452,12 +497,22 @@ private fun TerminalMapCockpit(
                 }
                 else -> state.activeRide.pickupAddress
             }
+            val liveInstruction = state.activeRoute.nextManeuver?.takeIf { it.isNotBlank() } ?: targetAddress
+            val liveDistanceLabel = buildString {
+                val distText = state.activeRoute.distanceText
+                val etaMins = state.activeRoute.etaMinutes
+                if (!distText.isNullOrBlank() && etaMins != null) {
+                    append("$distText • $etaMins min")
+                } else if (state.activeRide.distanceMiles > 0.0) {
+                    append("%.1f mi • %d min".format(state.activeRide.distanceMiles, state.activeRide.durationMinutes.coerceAtLeast(1)))
+                } else {
+                    append("Live GPS Active")
+                }
+            }
             LockedNavigationHud(
                 heading = navHeading,
-                instruction = targetAddress,
-                distanceLabel = if (state.activeRide.distanceMiles > 0.0) {
-                    "%.1f mi • %d min".format(state.activeRide.distanceMiles, state.activeRide.durationMinutes.coerceAtLeast(1))
-                } else "Live GPS Active",
+                instruction = liveInstruction,
+                distanceLabel = liveDistanceLabel,
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .statusBarsPadding()
@@ -476,22 +531,36 @@ private fun TerminalMapCockpit(
         ) {
             BatteryStatusPill(context = context)
 
-            // Circular Menu (☰) Button -> opens DriverMenu
-            Surface(
-                onClick = { viewModel.openOverlay(DriverOverlayRoute.MENU) },
-                shape = CircleShape,
-                color = AnyRollerBgSecondary,
-                modifier = Modifier
-                    .size(50.dp)
-                    .border(1.dp, AnyRollerBorder, CircleShape)
-                    .testTag("driver_menu_button")
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Rounded.Menu,
-                        contentDescription = "Open Driver Menu",
-                        tint = AnyRollerTextPrimary,
-                        modifier = Modifier.size(24.dp)
+            // Circular Menu (☰) Button -> opens DriverMenu (subtle 8dp red dot if menu action needed)
+            Box(modifier = Modifier.size(50.dp)) {
+                Surface(
+                    onClick = { viewModel.openOverlay(DriverOverlayRoute.MENU) },
+                    shape = CircleShape,
+                    color = AnyRollerBgSecondary,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .border(1.dp, AnyRollerBorder, CircleShape)
+                        .testTag("driver_menu_button")
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Rounded.Menu,
+                            contentDescription = "Open Driver Menu",
+                            tint = AnyRollerTextPrimary,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                }
+                if (state.hasMenuAttentionDot) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 3.dp, end = 3.dp)
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(AnyRollerRed)
+                            .border(1.5.dp, AnyRollerBgPrimary, CircleShape)
+                            .testTag("driver_menu_attention_dot")
                     )
                 }
             }
@@ -526,22 +595,32 @@ private fun TerminalMapCockpit(
                 Surface(
                     onClick = {
                         val ride = state.activeRide
-                        val (lat, lng) = if (state.rideState == TerminalRideState.IN_PROGRESS) {
-                            val stop = ride.stops.getOrNull(ride.currentStopIndex)
-                            if (stop != null && (stop.lat != 0.0 || stop.lng != 0.0)) {
-                                stop.lat to stop.lng
+                        if (state.rideState == TerminalRideState.IN_PROGRESS) {
+                            val remainingWaypoints = ride.stops
+                                .drop(ride.currentStopIndex)
+                                .filter { it.lat != 0.0 || it.lng != 0.0 }
+                                .map { it.lat to it.lng }
+                            val (destLat, destLng, waypointsToPass) = if (ride.dropoffLat != 0.0 || ride.dropoffLng != 0.0) {
+                                Triple(ride.dropoffLat, ride.dropoffLng, remainingWaypoints)
                             } else {
-                                ride.dropoffLat to ride.dropoffLng
+                                val firstStop = remainingWaypoints.firstOrNull()
+                                Triple(firstStop?.first ?: ride.pickupLat, firstStop?.second ?: ride.pickupLng, emptyList())
                             }
+                            ExternalIntentHelpers.launchTurnByTurnNavigation(
+                                context = context,
+                                lat = destLat,
+                                lng = destLng,
+                                preferredNavApp = state.profile.defaultNavApp,
+                                waypoints = waypointsToPass
+                            )
                         } else {
-                            ride.pickupLat to ride.pickupLng
+                            ExternalIntentHelpers.launchTurnByTurnNavigation(
+                                context = context,
+                                lat = ride.pickupLat,
+                                lng = ride.pickupLng,
+                                preferredNavApp = state.profile.defaultNavApp
+                            )
                         }
-                        ExternalIntentHelpers.launchTurnByTurnNavigation(
-                            context = context,
-                            lat = lat,
-                            lng = lng,
-                            preferredNavApp = state.profile.defaultNavApp
-                        )
                     },
                     shape = CircleShape,
                     color = AnyRollerBlue,
@@ -607,6 +686,7 @@ private fun TerminalMapCockpit(
             TerminalRideState.IDLE -> {
                 FloatingOnlineStatusPill(
                     isOnline = state.isOnline,
+                    isNetworkConnected = state.isNetworkConnected,
                     todayEarnings = state.todayEarningsComputed,
                     ridesToday = state.metrics.ridesToday,
                     onToggleOnline = onToggleOnline,
@@ -620,6 +700,7 @@ private fun TerminalMapCockpit(
                     IncomingRideOfferOverlay(
                         offer = offer,
                         secondsLeft = state.offerSecondsLeft,
+                        totalSeconds = state.platformConfig.dispatchTimeoutSeconds,
                         isBusy = state.isBusy,
                         onAccept = { viewModel.acceptOffer(isStacked = false) },
                         onDecline = { viewModel.declineOffer(isStacked = false) },
@@ -772,6 +853,7 @@ private fun BatteryStatusPill(context: Context) {
 @Composable
 private fun FloatingOnlineStatusPill(
     isOnline: Boolean,
+    isNetworkConnected: Boolean,
     todayEarnings: Double,
     ridesToday: Int,
     onToggleOnline: () -> Unit,
@@ -785,9 +867,21 @@ private fun FloatingOnlineStatusPill(
         label = "pulseAlpha"
     )
 
-    val containerBg = if (isOnline) AnyRollerGreenDeep.copy(alpha = 0.88f) else AnyRollerBgSecondary.copy(alpha = 0.94f)
-    val borderColor = if (isOnline) AnyRollerGreen.copy(alpha = 0.65f) else AnyRollerBorder
-    val dotColor = if (isOnline) AnyRollerGreen.copy(alpha = pulseAlpha) else AnyRollerTextMuted
+    val containerBg = when {
+        !isNetworkConnected -> AnyRollerBgSecondary.copy(alpha = 0.96f)
+        isOnline -> AnyRollerGreenDeep.copy(alpha = 0.88f)
+        else -> AnyRollerBgSecondary.copy(alpha = 0.94f)
+    }
+    val borderColor = when {
+        !isNetworkConnected -> AnyRollerOrange.copy(alpha = 0.85f)
+        isOnline -> AnyRollerGreen.copy(alpha = 0.65f)
+        else -> AnyRollerBorder
+    }
+    val dotColor = when {
+        !isNetworkConnected -> AnyRollerOrange.copy(alpha = pulseAlpha)
+        isOnline -> AnyRollerGreen.copy(alpha = pulseAlpha)
+        else -> AnyRollerTextMuted
+    }
 
     Surface(
         onClick = onToggleOnline,
@@ -805,7 +899,7 @@ private fun FloatingOnlineStatusPill(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
                 Box(
                     modifier = Modifier
                         .size(12.dp)
@@ -815,34 +909,60 @@ private fun FloatingOnlineStatusPill(
                 Spacer(Modifier.width(12.dp))
                 Column {
                     Text(
-                        text = if (isOnline) "WAITING FOR JOBS" else "OFFLINE",
+                        text = when {
+                            !isNetworkConnected -> "NO SIGNAL — RETRYING"
+                            isOnline -> "WAITING FOR JOBS"
+                            else -> "OFFLINE"
+                        },
                         style = MaterialTheme.typography.titleMedium,
-                        color = AnyRollerTextPrimary,
+                        color = if (!isNetworkConnected) AnyRollerOrange else AnyRollerTextPrimary,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Today: £%.2f • %d trips • Tap to %s".format(
-                            todayEarnings,
-                            ridesToday,
-                            if (isOnline) "Go Offline" else "Go Online"
-                        ),
+                        text = if (!isNetworkConnected) {
+                            "Reconnecting to live dispatch • Today: £%.2f".format(todayEarnings)
+                        } else {
+                            "Today: £%.2f • %d trips • Tap to %s".format(
+                                todayEarnings,
+                                ridesToday,
+                                if (isOnline) "Go Offline" else "Go Online"
+                            )
+                        },
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (isOnline) AnyRollerTextPrimary.copy(alpha = 0.8f) else AnyRollerTextMuted
+                        color = if (isOnline && isNetworkConnected) AnyRollerTextPrimary.copy(alpha = 0.8f) else AnyRollerTextMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
 
+            Spacer(Modifier.width(8.dp))
+
             Box(
                 modifier = Modifier
                     .clip(RoundedCornerShape(14.dp))
-                    .background(if (isOnline) AnyRollerGreen else AnyRollerBorder)
+                    .background(
+                        when {
+                            !isNetworkConnected -> AnyRollerOrange.copy(alpha = 0.2f)
+                            isOnline -> AnyRollerGreen
+                            else -> AnyRollerBorder
+                        }
+                    )
                     .padding(horizontal = 12.dp, vertical = 6.dp)
             ) {
                 Text(
-                    text = if (isOnline) "ACTIVE" else "STANDBY",
+                    text = when {
+                        !isNetworkConnected -> "OFFLINE"
+                        isOnline -> "ACTIVE"
+                        else -> "STANDBY"
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.ExtraBold,
-                    color = if (isOnline) AnyRollerBgPrimary else AnyRollerTextPrimary
+                    color = when {
+                        !isNetworkConnected -> AnyRollerOrange
+                        isOnline -> AnyRollerBgPrimary
+                        else -> AnyRollerTextPrimary
+                    }
                 )
             }
         }

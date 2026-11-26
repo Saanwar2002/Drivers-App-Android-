@@ -43,6 +43,7 @@ googleid = "1.1.1"
 mapsCompose = "6.1.2"
 playServicesMaps = "19.0.0"
 androidxBrowser = "1.8.0"
+zxingCore = "3.5.3"
 
 
 [libraries]
@@ -81,6 +82,7 @@ play-services-location = { group = "com.google.android.gms", name = "play-servic
 play-services-maps = { group = "com.google.android.gms", name = "play-services-maps", version.ref = "playServicesMaps" }
 maps-compose = { group = "com.google.maps.android", name = "maps-compose", version.ref = "mapsCompose" }
 androidx-browser = { group = "androidx.browser", name = "browser", version.ref = "androidxBrowser" }
+zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxingCore" }
 androidx-camera-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "cameraCamera2" }
 androidx-camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "cameraLifecycle" }
 androidx-camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "cameraView" }

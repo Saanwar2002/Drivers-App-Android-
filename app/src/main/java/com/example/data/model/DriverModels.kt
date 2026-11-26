@@ -153,6 +153,8 @@ data class RideRequest(
     val price: Double? = null,
     val quotedPrice: Double? = null,
     val surgeMultiplier: Double = 1.0,
+    val surgeModel: String = "multiplier",
+    val surgeFixedAmount: Double = 0.0,
     val vehicleCategory: String = "standard",
     val distanceMiles: Double = 0.0,
     val durationMinutes: Int = 0,
@@ -179,7 +181,12 @@ data class RideRequest(
     val completedAtMs: Long = 0L,
     val scheduledTime: String? = null,
     val offeredAtMs: Long = 0L,
-    val expiresAtMs: Long = 0L
+    val expiresAtMs: Long = 0L,
+    val isModifiedByPassenger: Boolean = false,
+    val cancelledBy: String? = null,
+    val cancellationFee: Double = 0.0,
+    val cashCollected: Double? = null,
+    val unpaidBalance: Double = 0.0
 )
 
 @Keep
@@ -247,29 +254,85 @@ data class SurgeRules(
     val highFee: Double = 3.5,
     val lowMultiplier: Double = 1.1,
     val mediumMultiplier: Double = 1.3,
-    val highMultiplier: Double = 1.6
+    val highMultiplier: Double = 1.6,
+    val lowColor: String = "green",
+    val mediumColor: String = "amber",
+    val highColor: String = "red",
+    val surgeOpacity: Int = 40
+)
+
+@Keep
+data class VehicleTypeConfig(
+    val id: String = "standard",
+    val name: String = "AnyTrader Standard",
+    val multiplier: Double = 1.0
+)
+
+fun defaultVehicleTypes(): List<VehicleTypeConfig> = listOf(
+    VehicleTypeConfig("standard", "Standard", 1.0),
+    VehicleTypeConfig("executive", "Executive", 1.5),
+    VehicleTypeConfig("mpv", "XL (6-Seater)", 1.4),
+    VehicleTypeConfig("van", "Pro Van", 1.8),
+    VehicleTypeConfig("vip", "VIP Luxury", 2.2)
 )
 
 @Keep
 data class RidePlatformConfig(
+    val baseFare: Double = 2.5,
+    val distanceRate: Double = 1.2,
+    val timeRate: Double = 0.15,
+    val waitRatePerMinute: Double = 0.25,
+    val minFare: Double = 5.0,
+    val priorityFee: Double = 3.0,
     val commissionRate: Double = 0.12,
     val goldCommissionRate: Double = 0.10,
     val fixedTripFee: Double = 0.0,
     val maxDailyDriverHours: Double = 10.0,
     val freeWaitSeconds: Int = 180,
-    val surgeRules: SurgeRules = SurgeRules()
+    val dispatchRadiusMiles: Double = 15.0,
+    val dispatchTimeoutSeconds: Int = 15,
+    val autoDispatchEnabled: Boolean = true,
+    val allowRiderAbandonment: Boolean = false,
+    val surgeEnabled: Boolean = true,
+    val surgeModel: String = "fixed", // fixed | multiplier
+    val surgeFixedAmount: Double = 2.0,
+    val surgeMultiplierValue: Double = 1.4,
+    val surgeRules: SurgeRules = SurgeRules(),
+    val vehicleTypes: List<VehicleTypeConfig> = defaultVehicleTypes()
+)
+
+@Keep
+data class GlobalTiersConfig(
+    val standardCommissionRate: Double? = null,
+    val standardFixedTripFee: Double? = null,
+    val goldCommissionRate: Double? = null,
+    val goldFixedTripFee: Double? = null
+)
+
+@Keep
+data class GlobalPlatformStatus(
+    val maintenanceMode: Boolean = false,
+    val maintenanceMessage: String? = null,
+    val taxiComingSoon: Boolean = false,
+    val taxiComingSoonTitle: String? = null,
+    val taxiComingSoonMessage: String? = null
 )
 
 @Keep
 data class DemandZone(
     val id: String = "",
     val name: String = "",
+    val label: String = "",
     val lat: Double = 0.0,
     val lng: Double = 0.0,
-    val level: String = "moderate", // high | moderate | low
+    val level: String = "medium", // high | medium | low
     val multiplier: Double = 1.0,
     val surgeFee: Double = 0.0,
-    val radiusMeters: Double = 800.0
+    val isFixedModel: Boolean = true,
+    val radiusMeters: Double = 800.0,
+    val uiColor: String = "amber",
+    val uiOpacity: Int = 40,
+    val waitWarning: Boolean = false
 )
 
 @Keep
