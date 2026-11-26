@@ -1,0 +1,1085 @@
+package com.example.ui.screens
+
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.material.icons.rounded.Call
+import androidx.compose.material.icons.rounded.ChatBubble
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.CreditCard
+import androidx.compose.material.icons.rounded.Flag
+import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.Payments
+import androidx.compose.material.icons.rounded.QrCode2
+import androidx.compose.material.icons.rounded.Report
+import androidx.compose.material.icons.rounded.Star
+import androidx.compose.material.icons.rounded.StarOutline
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import coil.compose.AsyncImage
+import com.example.data.model.FallbackFareConfig
+import com.example.data.model.RideRequest
+import com.example.data.model.resolveRideFinancialSummary
+import com.example.service.ExternalIntentHelpers
+import com.example.ui.theme.AnyRollerBgInput
+import com.example.ui.theme.AnyRollerBgPrimary
+import com.example.ui.theme.AnyRollerBgSecondary
+import com.example.ui.theme.AnyRollerBgTertiary
+import com.example.ui.theme.AnyRollerBlue
+import com.example.ui.theme.AnyRollerBorder
+import com.example.ui.theme.AnyRollerGreen
+import com.example.ui.theme.AnyRollerGreenDeep
+import com.example.ui.theme.AnyRollerOrange
+import com.example.ui.theme.AnyRollerPurple
+import com.example.ui.theme.AnyRollerRed
+import com.example.ui.theme.AnyRollerTextMuted
+import com.example.ui.theme.AnyRollerTextPrimary
+import com.example.ui.theme.AnyRollerTextSecondary
+import com.example.ui.theme.JetBrainsMonoFont
+import com.example.viewmodel.DriverTerminalUiState
+import com.example.viewmodel.DriverTerminalViewModel
+import com.example.viewmodel.TerminalRideState
+
+/**
+ * Exact 1:1 mirror of Incoming Ride Offer Overlay (Screen 3):
+ * Highlight header -> Rider Details + Circular 15s Countdown Ring -> Fare Section -> Route Line -> Accept / Decline.
+ */
+@Composable
+fun IncomingRideOfferOverlay(
+    offer: RideRequest,
+    secondsLeft: Int,
+    isBusy: Boolean,
+    onAccept: () -> Unit,
+    onDecline: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        color = AnyRollerBgSecondary,
+        shape = RoundedCornerShape(24.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .border(1.5.dp, AnyRollerGreen.copy(alpha = 0.7f), RoundedCornerShape(24.dp))
+    ) {
+        Column(modifier = Modifier.padding(18.dp)) {
+            // Highlight Header
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(AnyRollerGreen.copy(alpha = 0.18f))
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = offer.vehicleCategory.uppercase(),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = AnyRollerGreen,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    if (offer.surgeMultiplier > 1.0) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(AnyRollerOrange.copy(alpha = 0.2f))
+                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = "%.1fx SURGE".format(offer.surgeMultiplier),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = AnyRollerOrange,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+                Text(
+                    text = offer.paymentMethod.uppercase(),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = AnyRollerTextMuted
+                )
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            // Rider Details + Circular 15s Countdown Ring
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clip(CircleShape)
+                            .background(AnyRollerBgTertiary),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = offer.passengerName.firstOrNull()?.uppercase() ?: "P",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = AnyRollerTextPrimary
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column {
+                        Text(
+                            text = offer.passengerName,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = AnyRollerTextPrimary
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.Star, contentDescription = null, tint = AnyRollerOrange, modifier = Modifier.size(14.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                text = "%.1f • %.1f mi • %d min".format(
+                                    offer.passengerRating,
+                                    offer.distanceMiles,
+                                    offer.durationMinutes.coerceAtLeast(1)
+                                ),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = AnyRollerTextMuted
+                            )
+                        }
+                    }
+                }
+
+                // Circular 15s Countdown Ring
+                Box(contentAlignment = Alignment.Center, modifier = Modifier.size(54.dp)) {
+                    val sweep = (secondsLeft.coerceIn(0, 15) / 15f) * 360f
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        drawArc(
+                            color = AnyRollerBorder,
+                            startAngle = -90f,
+                            sweepAngle = 360f,
+                            useCenter = false,
+                            style = Stroke(width = 5.dp.toPx(), cap = StrokeCap.Round)
+                        )
+                        drawArc(
+                            color = if (secondsLeft <= 5) AnyRollerRed else AnyRollerGreen,
+                            startAngle = -90f,
+                            sweepAngle = sweep,
+                            useCenter = false,
+                            style = Stroke(width = 5.dp.toPx(), cap = StrokeCap.Round)
+                        )
+                    }
+                    Text(
+                        text = "${secondsLeft}s",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontFamily = JetBrainsMonoFont,
+                        color = AnyRollerTextPrimary
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            // Fare Section below rider profile
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(AnyRollerBgPrimary)
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Estimated Fare", style = MaterialTheme.typography.bodySmall, color = AnyRollerTextMuted)
+                Text(
+                    text = "£%.2f".format(offer.fareEstimate),
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontFamily = JetBrainsMonoFont,
+                    color = AnyRollerGreen,
+                    fontWeight = FontWeight.ExtraBold
+                )
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            // Route Line
+            RouteAddressBlock(pickup = offer.pickupAddress, dropoff = offer.dropoffAddress)
+
+            Spacer(Modifier.height(16.dp))
+
+            // Accept / Decline buttons
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = onDecline,
+                    enabled = !isBusy,
+                    shape = RoundedCornerShape(14.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, AnyRollerBorder),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(52.dp)
+                        .testTag("decline_offer_button")
+                ) {
+                    Text("Decline", color = AnyRollerTextPrimary, fontWeight = FontWeight.SemiBold)
+                }
+                Button(
+                    onClick = onAccept,
+                    enabled = !isBusy,
+                    colors = ButtonDefaults.buttonColors(containerColor = AnyRollerGreen, contentColor = AnyRollerBgPrimary),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .weight(1.7f)
+                        .height(52.dp)
+                        .testTag("accept_offer_button")
+                ) {
+                    Text("ACCEPT RIDE", fontWeight = FontWeight.ExtraBold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun StackedRideOfferBanner(
+    offer: RideRequest,
+    secondsLeft: Int,
+    isBusy: Boolean,
+    onAccept: () -> Unit,
+    onDecline: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        color = AnyRollerBgSecondary,
+        shape = RoundedCornerShape(20.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .border(1.5.dp, AnyRollerPurple, RoundedCornerShape(20.dp))
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "NEXT QUEUED RIDE • £%.2f".format(offer.fareEstimate),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = AnyRollerPurple,
+                    fontWeight = FontWeight.Bold
+                )
+                Text("${secondsLeft}s", style = MaterialTheme.typography.labelMedium, color = AnyRollerOrange)
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = "${offer.pickupAddress} → ${offer.dropoffAddress}",
+                style = MaterialTheme.typography.bodySmall,
+                color = AnyRollerTextPrimary,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = onDecline,
+                    enabled = !isBusy,
+                    modifier = Modifier.weight(1f).height(44.dp).testTag("decline_stacked_button")
+                ) {
+                    Text("Skip", color = AnyRollerTextMuted)
+                }
+                Button(
+                    onClick = onAccept,
+                    enabled = !isBusy,
+                    colors = ButtonDefaults.buttonColors(containerColor = AnyRollerPurple, contentColor = Color.White),
+                    modifier = Modifier.weight(1.6f).height(44.dp).testTag("accept_stacked_button")
+                ) {
+                    Text("Queue Next Ride", fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ActiveTripSheetCard(
+    ride: RideRequest,
+    state: DriverTerminalUiState,
+    viewModel: DriverTerminalViewModel,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var passcodeInput by remember(ride.id) { mutableStateOf("") }
+    var showCancelConfirm by remember { mutableStateOf(false) }
+
+    val requiresPasscode = state.profile.requirePasscode || ride.driverRequirePasscode
+    val hasRemainingStop = state.rideState == TerminalRideState.IN_PROGRESS &&
+        ride.currentStopIndex < ride.stops.size
+
+    Surface(
+        color = AnyRollerBgSecondary,
+        shape = RoundedCornerShape(24.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .border(1.dp, AnyRollerBorder, RoundedCornerShape(24.dp))
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = when (state.rideState) {
+                            TerminalRideState.EN_ROUTE_PICKUP -> "EN ROUTE TO PICKUP"
+                            TerminalRideState.WAITING -> "WAITING FOR PASSENGER"
+                            else -> "TRIP IN PROGRESS"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = AnyRollerGreen,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = ride.passengerName,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = AnyRollerTextPrimary
+                    )
+                    if (!ride.riderNotes.isNullOrBlank()) {
+                        Text(
+                            text = "Note: ${ride.riderNotes}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = AnyRollerOrange,
+                            maxLines = 2
+                        )
+                    }
+                }
+
+                // Quick Chat & Call Buttons
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    IconButton(
+                        onClick = { viewModel.setChatSheetVisible(true) },
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(AnyRollerBgTertiary)
+                            .testTag("active_ride_chat_button")
+                    ) {
+                        Icon(Icons.Rounded.ChatBubble, contentDescription = "Open Rider Chat", tint = AnyRollerGreen)
+                    }
+                    if (!ride.passengerPhone.isNullOrBlank()) {
+                        IconButton(
+                            onClick = { ExternalIntentHelpers.dialPhoneNumber(context, ride.passengerPhone) },
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(AnyRollerBgTertiary)
+                                .testTag("active_ride_call_button")
+                        ) {
+                            Icon(Icons.Rounded.Call, contentDescription = "Call Passenger", tint = AnyRollerBlue)
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+            RouteAddressBlock(pickup = ride.pickupAddress, dropoff = ride.dropoffAddress)
+
+            if (state.rideState == TerminalRideState.WAITING) {
+                Spacer(Modifier.height(10.dp))
+                val freeLeft = (state.platformConfig.freeWaitSeconds - state.waitSecondsElapsed).coerceAtLeast(0)
+                val paidSecs = (state.waitSecondsElapsed - state.platformConfig.freeWaitSeconds).coerceAtLeast(0)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(AnyRollerBgPrimary)
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = if (freeLeft > 0) "Free Wait Remaining" else "Paid Wait Active",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (freeLeft > 0) AnyRollerTextMuted else AnyRollerOrange
+                    )
+                    val displaySecs = if (freeLeft > 0) freeLeft else paidSecs
+                    Text(
+                        text = "%02d:%02d".format(displaySecs / 60, displaySecs % 60),
+                        style = MaterialTheme.typography.titleSmall,
+                        fontFamily = JetBrainsMonoFont,
+                        color = if (freeLeft > 0) AnyRollerTextPrimary else AnyRollerOrange
+                    )
+                }
+
+                if (requiresPasscode) {
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = passcodeInput,
+                        onValueChange = { if (it.length <= 4) passcodeInput = it.filter(Char::isDigit) },
+                        label = { Text("4-Digit Passenger Passcode (PIN)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AnyRollerGreen,
+                            unfocusedBorderColor = AnyRollerBorder,
+                            focusedContainerColor = AnyRollerBgInput,
+                            unfocusedContainerColor = AnyRollerBgInput,
+                            focusedTextColor = AnyRollerTextPrimary,
+                            unfocusedTextColor = AnyRollerTextPrimary
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("ride_passcode_input")
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            // Primary Ride Action CTA
+            when (state.rideState) {
+                TerminalRideState.EN_ROUTE_PICKUP -> {
+                    Button(
+                        onClick = { viewModel.markArrivedAtPickup() },
+                        enabled = !state.isBusy,
+                        colors = ButtonDefaults.buttonColors(containerColor = AnyRollerGreen, contentColor = AnyRollerBgPrimary),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(52.dp)
+                            .testTag("arrived_pickup_button")
+                    ) {
+                        Text("ARRIVED AT PICKUP", fontWeight = FontWeight.ExtraBold)
+                    }
+                }
+                TerminalRideState.WAITING -> {
+                    Button(
+                        onClick = { viewModel.startTrip(passcodeInput) },
+                        enabled = !state.isBusy,
+                        colors = ButtonDefaults.buttonColors(containerColor = AnyRollerGreen, contentColor = AnyRollerBgPrimary),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(52.dp)
+                            .testTag("start_trip_button")
+                    ) {
+                        Text("START TRIP", fontWeight = FontWeight.ExtraBold)
+                    }
+                }
+                TerminalRideState.IN_PROGRESS -> {
+                    if (hasRemainingStop) {
+                        Button(
+                            onClick = { viewModel.advanceMultiStop() },
+                            enabled = !state.isBusy,
+                            colors = ButtonDefaults.buttonColors(containerColor = AnyRollerPurple, contentColor = Color.White),
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(52.dp)
+                                .testTag("next_stop_button")
+                        ) {
+                            Text("COMPLETE STOP ${ride.currentStopIndex + 1}", fontWeight = FontWeight.ExtraBold)
+                        }
+                    } else {
+                        Button(
+                            onClick = { viewModel.initiatePaymentHandshake() },
+                            enabled = !state.isBusy,
+                            colors = ButtonDefaults.buttonColors(containerColor = AnyRollerGreen, contentColor = AnyRollerBgPrimary),
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(52.dp)
+                                .testTag("complete_trip_button")
+                        ) {
+                            Text("COMPLETE TRIP", fontWeight = FontWeight.ExtraBold)
+                        }
+                    }
+                }
+                else -> Unit
+            }
+
+            if (state.rideState != TerminalRideState.IN_PROGRESS) {
+                Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    TextButton(
+                        onClick = { showCancelConfirm = true },
+                        modifier = Modifier.testTag("cancel_trip_button")
+                    ) {
+                        Text("Cancel Trip", color = AnyRollerRed)
+                    }
+                }
+            }
+        }
+    }
+
+    if (showCancelConfirm) {
+        AlertDialog(
+            onDismissRequest = { showCancelConfirm = false },
+            containerColor = AnyRollerBgSecondary,
+            title = { Text("Cancel Active Trip?", color = AnyRollerTextPrimary) },
+            text = { Text("Cancelling an accepted ride may affect your cancellation rate.", color = AnyRollerTextSecondary) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showCancelConfirm = false
+                    viewModel.cancelActiveRide()
+                }) { Text("Confirm Cancel", color = AnyRollerRed) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCancelConfirm = false }) { Text("Keep Trip", color = AnyRollerTextPrimary) }
+            }
+        )
+    }
+}
+
+@Composable
+fun PaymentHandshakeCard(
+    ride: RideRequest,
+    state: DriverTerminalUiState,
+    viewModel: DriverTerminalViewModel,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val summary = remember(ride, state.activeCommissionRate) {
+        resolveRideFinancialSummary(
+            ride,
+            FallbackFareConfig(state.activeCommissionRate, state.platformConfig.fixedTripFee)
+        )
+    }
+    var cashInput by remember(ride.id) { mutableStateOf("%.2f".format(summary.totalFarePaid)) }
+
+    Surface(
+        color = AnyRollerBgSecondary,
+        shape = RoundedCornerShape(24.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .border(1.dp, AnyRollerGreen.copy(alpha = 0.6f), RoundedCornerShape(24.dp))
+    ) {
+        Column(modifier = Modifier.padding(18.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = when (ride.paymentMethod.lowercase()) {
+                        "cash" -> Icons.Rounded.Payments
+                        "qr" -> Icons.Rounded.QrCode2
+                        else -> Icons.Rounded.CreditCard
+                    },
+                    contentDescription = null,
+                    tint = AnyRollerGreen
+                )
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text("Trip Payment Settlement", style = MaterialTheme.typography.titleMedium, color = AnyRollerTextPrimary)
+                    Text("Method: ${ride.paymentMethod.uppercase()}", style = MaterialTheme.typography.labelSmall, color = AnyRollerTextMuted)
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(AnyRollerBgPrimary)
+                    .padding(14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text("Total Fare", color = AnyRollerTextSecondary)
+                Text(
+                    "£%.2f".format(summary.totalFarePaid),
+                    style = MaterialTheme.typography.titleLarge,
+                    fontFamily = JetBrainsMonoFont,
+                    color = AnyRollerGreen,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            if (ride.paymentMethod.equals("cash", ignoreCase = true)) {
+                OutlinedTextField(
+                    value = cashInput,
+                    onValueChange = { cashInput = it },
+                    label = { Text("Cash Collected (£)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AnyRollerGreen,
+                        unfocusedBorderColor = AnyRollerBorder,
+                        focusedContainerColor = AnyRollerBgInput,
+                        unfocusedContainerColor = AnyRollerBgInput,
+                        focusedTextColor = AnyRollerTextPrimary,
+                        unfocusedTextColor = AnyRollerTextPrimary
+                    ),
+                    modifier = Modifier.fillMaxWidth().testTag("cash_collected_input")
+                )
+                Spacer(Modifier.height(12.dp))
+                Button(
+                    onClick = {
+                        viewModel.completeTripWithAction(
+                            action = "cash_finalize",
+                            cashCollected = cashInput.toDoubleOrNull() ?: summary.totalFarePaid
+                        )
+                    },
+                    enabled = !state.isBusy,
+                    colors = ButtonDefaults.buttonColors(containerColor = AnyRollerGreen, contentColor = AnyRollerBgPrimary),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth().height(52.dp).testTag("confirm_cash_button")
+                ) {
+                    Text("CONFIRM CASH RECEIVED", fontWeight = FontWeight.ExtraBold)
+                }
+            } else {
+                if (!state.paymentQrUrl.isNullOrBlank()) {
+                    OutlinedButton(
+                        onClick = { ExternalIntentHelpers.openCustomTab(context, state.paymentQrUrl) },
+                        shape = RoundedCornerShape(14.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, AnyRollerBlue),
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) {
+                        Icon(Icons.Rounded.QrCode2, contentDescription = null, tint = AnyRollerBlue)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Open Payment Link / QR", color = AnyRollerBlue)
+                    }
+                    Spacer(Modifier.height(10.dp))
+                }
+                Button(
+                    onClick = {
+                        val action = if (ride.hasCardOnFile) "auto_card" else "qr_manual_close"
+                        viewModel.completeTripWithAction(action = action)
+                    },
+                    enabled = !state.isBusy,
+                    colors = ButtonDefaults.buttonColors(containerColor = AnyRollerGreen, contentColor = AnyRollerBgPrimary),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth().height(52.dp).testTag("finalize_card_payment_button")
+                ) {
+                    Text(
+                        if (ride.hasCardOnFile) "CHARGE CARD & FINISH" else "MARK PAYMENT COMPLETE",
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TripReviewOverlayCard(
+    ride: RideRequest,
+    state: DriverTerminalUiState,
+    onSubmitRating: (Int, String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val summary = remember(ride, state.activeCommissionRate) {
+        resolveRideFinancialSummary(
+            ride,
+            FallbackFareConfig(state.activeCommissionRate, state.platformConfig.fixedTripFee)
+        )
+    }
+    var targetEarnings by remember { mutableStateOf(0f) }
+    LaunchedEffect(summary.driverEarnings) {
+        targetEarnings = summary.driverEarnings.toFloat()
+    }
+    val animatedEarnings by animateFloatAsState(
+        targetValue = targetEarnings,
+        animationSpec = tween(durationMillis = 800),
+        label = "earningsCountUp"
+    )
+
+    var selectedStars by remember { mutableIntStateOf(5) }
+    var comment by remember { mutableStateOf("") }
+
+    Surface(
+        color = AnyRollerBgSecondary,
+        shape = RoundedCornerShape(24.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .border(1.dp, AnyRollerGreen.copy(alpha = 0.6f), RoundedCornerShape(24.dp))
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = AnyRollerGreen, modifier = Modifier.size(36.dp))
+            Spacer(Modifier.height(6.dp))
+            Text("Trip Completed!", style = MaterialTheme.typography.titleMedium, color = AnyRollerTextPrimary)
+            Text(
+                text = "+£%.2f".format(animatedEarnings),
+                style = MaterialTheme.typography.headlineLarge,
+                fontFamily = JetBrainsMonoFont,
+                color = AnyRollerGreen,
+                fontWeight = FontWeight.ExtraBold
+            )
+
+            Spacer(Modifier.height(10.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(AnyRollerBgPrimary)
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                BreakdownRow("Base Fare", "£%.2f".format(summary.baseFare))
+                BreakdownRow("Platform Fee (%.1f%%)".format(summary.appliedCommissionPct), "-£%.2f".format(summary.platformFee))
+                if (summary.tipAmount > 0.0) {
+                    BreakdownRow("Passenger Tip (100% Yours)", "+£%.2f".format(summary.tipAmount), AnyRollerGreen)
+                }
+                HorizontalDivider(color = AnyRollerBorder, modifier = Modifier.padding(vertical = 4.dp))
+                BreakdownRow("Net Driver Earnings", "£%.2f".format(summary.driverEarnings), AnyRollerGreen)
+            }
+
+            Spacer(Modifier.height(14.dp))
+            Text("Rate ${ride.passengerName}", style = MaterialTheme.typography.labelLarge, color = AnyRollerTextPrimary)
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (star in 1..5) {
+                    IconButton(
+                        onClick = { selectedStars = star },
+                        modifier = Modifier.testTag("review_star_$star")
+                    ) {
+                        Icon(
+                            imageVector = if (star <= selectedStars) Icons.Rounded.Star else Icons.Rounded.StarOutline,
+                            contentDescription = "Rate $star stars",
+                            tint = if (star <= selectedStars) AnyRollerOrange else AnyRollerTextMuted,
+                            modifier = Modifier.size(32.dp)
+                        )
+                    }
+                }
+            }
+
+            if (selectedStars < 5) {
+                OutlinedTextField(
+                    value = comment,
+                    onValueChange = { comment = it },
+                    label = { Text("Required: Tell us what went wrong") },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AnyRollerOrange,
+                        unfocusedBorderColor = AnyRollerBorder,
+                        focusedContainerColor = AnyRollerBgInput,
+                        unfocusedContainerColor = AnyRollerBgInput,
+                        focusedTextColor = AnyRollerTextPrimary,
+                        unfocusedTextColor = AnyRollerTextPrimary
+                    ),
+                    modifier = Modifier.fillMaxWidth().testTag("review_comment_input")
+                )
+                Spacer(Modifier.height(10.dp))
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = { onSubmitRating(selectedStars, comment) },
+                enabled = !state.isBusy,
+                colors = ButtonDefaults.buttonColors(containerColor = AnyRollerGreen, contentColor = AnyRollerBgPrimary),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+                    .testTag("done_back_to_map_button")
+            ) {
+                Text("DONE — BACK TO MAP", fontWeight = FontWeight.ExtraBold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun BreakdownRow(label: String, value: String, valueColor: Color = AnyRollerTextPrimary) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, style = MaterialTheme.typography.bodySmall, color = AnyRollerTextMuted)
+        Text(value, style = MaterialTheme.typography.bodySmall, fontFamily = JetBrainsMonoFont, color = valueColor, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+fun RouteAddressBlock(pickup: String, dropoff: String) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(AnyRollerGreen))
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = pickup,
+                style = MaterialTheme.typography.bodyMedium,
+                color = AnyRollerTextPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(AnyRollerRed))
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = dropoff,
+                style = MaterialTheme.typography.bodyMedium,
+                color = AnyRollerTextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+fun RideChatModalSheet(
+    state: DriverTerminalUiState,
+    viewModel: DriverTerminalViewModel,
+    onDismiss: () -> Unit
+) {
+    val ride = state.activeRide ?: return
+    var messageText by remember { mutableStateOf("") }
+    var showSafetyDialog by remember { mutableStateOf(false) }
+    var reportReason by remember { mutableStateOf("") }
+
+    val photoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.sendChatMessage(text = "", imageUri = uri)
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.65f))
+            .clickable(onClick = onDismiss),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(
+            color = AnyRollerBgPrimary,
+            shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.82f)
+                .clickable(enabled = false) {}
+        ) {
+            Column(modifier = Modifier.fillMaxSize().navigationBarsPadding()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(AnyRollerBgSecondary)
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column {
+                        Text("Chat with ${ride.passengerName}", style = MaterialTheme.typography.titleMedium, color = AnyRollerTextPrimary)
+                        Text("Live in-app chat • 45s smart offline fallback", style = MaterialTheme.typography.labelSmall, color = AnyRollerGreen)
+                    }
+                    Row {
+                        IconButton(onClick = { showSafetyDialog = true }, modifier = Modifier.testTag("chat_report_button")) {
+                            Icon(Icons.Rounded.Report, contentDescription = "Report or Block Passenger", tint = AnyRollerOrange)
+                        }
+                        IconButton(onClick = onDismiss, modifier = Modifier.testTag("close_chat_button")) {
+                            Icon(Icons.Rounded.Close, contentDescription = "Close Chat", tint = AnyRollerTextPrimary)
+                        }
+                    }
+                }
+
+                // Quick replies
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf("I'm here", "On my way", "Stuck in traffic").forEach { quick ->
+                        Surface(
+                            onClick = { viewModel.sendChatMessage(quick) },
+                            shape = RoundedCornerShape(16.dp),
+                            color = AnyRollerBgSecondary,
+                            modifier = Modifier.border(1.dp, AnyRollerBorder, RoundedCornerShape(16.dp))
+                        ) {
+                            Text(
+                                text = quick,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = AnyRollerTextPrimary,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
+                }
+
+                LazyColumn(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(state.chatMessages, key = { it.id }) { msg ->
+                        val isMe = msg.senderId == state.uid
+                        Box(
+                            modifier = Modifier.fillMaxWidth(),
+                            contentAlignment = if (isMe) Alignment.CenterEnd else Alignment.CenterStart
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(if (isMe) AnyRollerGreenDeep else AnyRollerBgSecondary)
+                                    .padding(10.dp)
+                            ) {
+                                if (!msg.imageUrl.isNullOrBlank()) {
+                                    AsyncImage(
+                                        model = msg.imageUrl,
+                                        contentDescription = "Chat photo",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier
+                                            .size(180.dp)
+                                            .clip(RoundedCornerShape(10.dp))
+                                    )
+                                    if (!msg.text.isNullOrBlank()) Spacer(Modifier.height(6.dp))
+                                }
+                                if (!msg.text.isNullOrBlank()) {
+                                    Text(msg.text, style = MaterialTheme.typography.bodyMedium, color = AnyRollerTextPrimary)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(AnyRollerBgSecondary)
+                        .padding(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = {
+                            photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                        },
+                        modifier = Modifier.testTag("chat_photo_button")
+                    ) {
+                        Icon(Icons.Rounded.Image, contentDescription = "Attach Photo", tint = AnyRollerTextMuted)
+                    }
+                    OutlinedTextField(
+                        value = messageText,
+                        onValueChange = { messageText = it },
+                        placeholder = { Text("Message passenger...", color = AnyRollerTextMuted) },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AnyRollerGreen,
+                            unfocusedBorderColor = AnyRollerBorder,
+                            focusedContainerColor = AnyRollerBgInput,
+                            unfocusedContainerColor = AnyRollerBgInput,
+                            focusedTextColor = AnyRollerTextPrimary,
+                            unfocusedTextColor = AnyRollerTextPrimary
+                        ),
+                        shape = RoundedCornerShape(20.dp),
+                        modifier = Modifier.weight(1f).testTag("chat_message_input")
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    IconButton(
+                        onClick = {
+                            if (messageText.isNotBlank()) {
+                                viewModel.sendChatMessage(messageText)
+                                messageText = ""
+                            }
+                        },
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(AnyRollerGreen)
+                            .testTag("chat_send_button")
+                    ) {
+                        Icon(Icons.AutoMirrored.Rounded.Send, contentDescription = "Send Message", tint = AnyRollerBgPrimary)
+                    }
+                }
+            }
+        }
+    }
+
+    if (showSafetyDialog) {
+        AlertDialog(
+            onDismissRequest = { showSafetyDialog = false },
+            containerColor = AnyRollerBgSecondary,
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Rounded.Flag, contentDescription = null, tint = AnyRollerRed)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Report / Block Passenger", color = AnyRollerTextPrimary)
+                }
+            },
+            text = {
+                Column {
+                    Text("Submit a safety report to AnyRoller Support.", color = AnyRollerTextSecondary, style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = reportReason,
+                        onValueChange = { reportReason = it },
+                        label = { Text("Reason") },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AnyRollerRed,
+                            unfocusedBorderColor = AnyRollerBorder,
+                            focusedTextColor = AnyRollerTextPrimary,
+                            unfocusedTextColor = AnyRollerTextPrimary
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val reason = reportReason.ifBlank { "Safety concern during trip" }
+                    viewModel.reportAndBlockActivePassenger(reason, blockUser = true)
+                    showSafetyDialog = false
+                }) { Text("Report & Block", color = AnyRollerRed) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSafetyDialog = false }) { Text("Cancel", color = AnyRollerTextMuted) }
+            }
+        )
+    }
+}

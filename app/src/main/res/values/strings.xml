@@ -1,0 +1,21 @@
+<resources>
+    <string name="app_name">AnyRoller Driver</string>
+    <string name="nav_terminal">Terminal</string>
+    <string name="nav_earnings">Earnings</string>
+    <string name="nav_messages">Messages</string>
+    <string name="nav_my_jobs">My Jobs</string>
+    <string name="status_waiting_jobs">Waiting for Jobs</string>
+    <string name="status_offline">Offline</string>
+    <string name="status_active">ACTIVE</string>
+    <string name="status_standby">STANDBY</string>
+    <string name="action_go_online">Go Online</string>
+    <string name="action_go_offline">Go Offline</string>
+    <string name="action_accept_ride">Accept Ride</string>
+    <string name="action_decline">Decline</string>
+    <string name="action_arrived_pickup">Arrived at Pickup</string>
+    <string name="action_start_trip">Start Trip</string>
+    <string name="action_complete_trip">Complete Trip</string>
+    <string name="action_sign_in_google">Sign in with Google</string>
+    <string name="action_sign_in_email">Sign in with Email</string>
+    <string name="support_email">support@anytrader.co.uk</string>
+</resources>
