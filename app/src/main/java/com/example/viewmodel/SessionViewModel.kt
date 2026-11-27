@@ -18,6 +18,7 @@ import com.example.data.model.DriverProfile
 import com.example.data.network.AcceptTermsRequest
 import com.example.data.network.ApiClient
 import com.example.data.network.ApiResult
+import com.example.data.network.DeleteAccountRequest
 import com.example.data.network.RegisterTokenRequest
 import com.example.data.network.UnregisterTokenRequest
 import com.example.data.repository.DriverFirestoreRepository
@@ -326,7 +327,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
                 ApiClient.service.acceptTerms(
                     AcceptTermsRequest(
                         termsVersion = CURRENT_TERMS_VERSION,
-                        privacyVersion = CURRENT_TERMS_VERSION,
+                        compulsoryAgreed = true,
                         marketingOptIn = marketingOptIn,
                         partnerDataSharingOptIn = partnerSharingOptIn
                     )
@@ -363,7 +364,11 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
 
     fun deleteAccountPermanently(onResult: (Boolean, String) -> Unit) {
         viewModelScope.launch {
-            when (val res = ApiClient.safeCall { ApiClient.service.deleteAccount() }) {
+            when (
+                val res = ApiClient.safeCall {
+                    ApiClient.service.deleteAccount(DeleteAccountRequest(confirmationText = "DELETE"))
+                }
+            ) {
                 is ApiResult.Success -> {
                     onResult(true, "Your account deletion request has been completed.")
                     signOut()

@@ -10,17 +10,28 @@ import okhttp3.Request
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
+data class RouteStep(
+    val instruction: String,
+    val distanceMeters: Int,
+    val startLat: Double,
+    val startLng: Double,
+    val endLat: Double,
+    val endLng: Double
+)
+
 data class ActiveRouteResult(
     val points: List<LatLng> = emptyList(),
     val etaMinutes: Int? = null,
     val distanceText: String? = null,
-    val nextManeuver: String? = null
+    val totalDistanceMeters: Int = 0,
+    val nextManeuver: String? = null,
+    val steps: List<RouteStep> = emptyList()
 )
 
 /**
  * Cost-capped Google Directions REST client mirroring DriverTerminal.tsx:
  * - Decodes encoded overview_polyline for crisp dark-map rendering
- * - Extracts live ETA, distance, and next turn instruction for the Locked Blue HUD
+ * - Extracts full step-by-step maneuvers for live in-app voice guidance & Locked Blue HUD
  * - Gracefully falls back to a clean direct route line if MAPS_API_KEY is unconfigured or restricted
  */
 class DirectionsRepository {
@@ -42,6 +53,7 @@ class DirectionsRepository {
         val fallbackPoints = listOf(LatLng(originLat, originLng), LatLng(destLat, destLng))
         val results = FloatArray(1)
         Location.distanceBetween(originLat, originLng, destLat, destLng, results)
+        val fallbackMeters = results[0].toInt().coerceAtLeast(0)
         val fallbackMiles = results[0] / 1609.344
         val fallbackMins = ((fallbackMiles / 22.0) * 60.0).toInt().coerceAtLeast(1)
 
@@ -50,7 +62,8 @@ class DirectionsRepository {
             return ActiveRouteResult(
                 points = fallbackPoints,
                 etaMinutes = fallbackMins,
-                distanceText = "%.1f mi".format(fallbackMiles)
+                distanceText = "%.1f mi".format(fallbackMiles),
+                totalDistanceMeters = fallbackMeters
             )
         }
 
@@ -66,7 +79,8 @@ class DirectionsRepository {
                         return@withContext ActiveRouteResult(
                             points = fallbackPoints,
                             etaMinutes = fallbackMins,
-                            distanceText = "%.1f mi".format(fallbackMiles)
+                            distanceText = "%.1f mi".format(fallbackMiles),
+                            totalDistanceMeters = fallbackMeters
                         )
                     }
                     val body = resp.body?.string().orEmpty()
@@ -76,7 +90,8 @@ class DirectionsRepository {
                         return@withContext ActiveRouteResult(
                             points = fallbackPoints,
                             etaMinutes = fallbackMins,
-                            distanceText = "%.1f mi".format(fallbackMiles)
+                            distanceText = "%.1f mi".format(fallbackMiles),
+                            totalDistanceMeters = fallbackMeters
                         )
                     }
                     val route0 = routes.getJSONObject(0)
@@ -84,30 +99,65 @@ class DirectionsRepository {
                     val decoded = if (encoded.isNotBlank()) decodePolyline(encoded) else fallbackPoints
                     val leg0 = route0.optJSONArray("legs")?.optJSONObject(0)
                     val durSec = leg0?.optJSONObject("duration")?.optInt("value") ?: (fallbackMins * 60)
+                    val totalDistMeters = leg0?.optJSONObject("distance")?.optInt("value") ?: fallbackMeters
                     val distText = leg0?.optJSONObject("distance")?.optString("text")
                         ?: "%.1f mi".format(fallbackMiles)
-                    val rawStepHtml = leg0?.optJSONArray("steps")?.optJSONObject(0)?.optString("html_instructions")
-                    val cleanManeuver = rawStepHtml
-                        ?.replace(Regex("<[^>]*>"), " ")
-                        ?.replace(Regex("\\s+"), " ")
-                        ?.trim()
-                        ?.takeIf { it.isNotBlank() }
+
+                    val parsedSteps = mutableListOf<RouteStep>()
+                    val stepsArr = leg0?.optJSONArray("steps")
+                    if (stepsArr != null) {
+                        for (i in 0 until stepsArr.length()) {
+                            val stepObj = stepsArr.optJSONObject(i) ?: continue
+                            val cleanInstruction = stripHtml(stepObj.optString("html_instructions"))
+                            if (cleanInstruction.isBlank()) continue
+                            val stepDist = stepObj.optJSONObject("distance")?.optInt("value") ?: 0
+                            val startLoc = stepObj.optJSONObject("start_location")
+                            val endLoc = stepObj.optJSONObject("end_location")
+                            parsedSteps += RouteStep(
+                                instruction = cleanInstruction,
+                                distanceMeters = stepDist,
+                                startLat = startLoc?.optDouble("lat") ?: originLat,
+                                startLng = startLoc?.optDouble("lng") ?: originLng,
+                                endLat = endLoc?.optDouble("lat") ?: destLat,
+                                endLng = endLoc?.optDouble("lng") ?: destLng
+                            )
+                        }
+                    }
 
                     ActiveRouteResult(
                         points = decoded.ifEmpty { fallbackPoints },
                         etaMinutes = (durSec / 60).coerceAtLeast(1),
                         distanceText = distText,
-                        nextManeuver = cleanManeuver
+                        totalDistanceMeters = totalDistMeters,
+                        nextManeuver = parsedSteps.firstOrNull()?.instruction,
+                        steps = parsedSteps
                     )
                 }
             }.getOrElse {
                 ActiveRouteResult(
                     points = fallbackPoints,
                     etaMinutes = fallbackMins,
-                    distanceText = "%.1f mi".format(fallbackMiles)
+                    distanceText = "%.1f mi".format(fallbackMiles),
+                    totalDistanceMeters = fallbackMeters
                 )
             }
         }
+    }
+
+    private fun stripHtml(raw: String?): String {
+        if (raw.isNullOrBlank()) return ""
+        return raw
+            .replace(Regex("<div[^>]*>", RegexOption.IGNORE_CASE), ". ")
+            .replace(Regex("<[^>]*>"), " ")
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&#39;", "'")
+            .replace("&quot;", "\"")
+            .replace(Regex("\\s+"), " ")
+            .replace(Regex("\\.\\s*\\."), ".")
+            .trim()
     }
 
     private fun decodePolyline(encoded: String): List<LatLng> {

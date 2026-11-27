@@ -30,7 +30,7 @@ interface AnyRollerApiService {
     suspend fun exportGdprData(@Body body: Map<String, String> = emptyMap()): Response<GdprExportResponse>
 
     @POST("/api/account/gdpr/delete-account")
-    suspend fun deleteAccount(@Body body: Map<String, String> = emptyMap()): Response<GenericSuccessResponse>
+    suspend fun deleteAccount(@Body body: DeleteAccountRequest = DeleteAccountRequest()): Response<GenericSuccessResponse>
 
     // --- Push Token Lifecycle, Inbox, Presence & 4-Tier WhatsApp ---
     @POST("/api/notifications/register-token")
@@ -93,6 +93,9 @@ interface AnyRollerApiService {
     @POST("/api/rides/accept")
     suspend fun acceptRide(@Body body: RideAcceptRequest): Response<GenericSuccessResponse>
 
+    @POST("/api/rides/decline")
+    suspend fun declineRide(@Body body: RideDeclineRequest): Response<GenericSuccessResponse>
+
     @POST("/api/rides/transition")
     suspend fun transitionRide(@Body body: RideTransitionRequest): Response<GenericSuccessResponse>
 
@@ -104,6 +107,9 @@ interface AnyRollerApiService {
 
     @POST("/api/rides/cancel")
     suspend fun cancelRide(@Body body: RideCancelRequest): Response<GenericSuccessResponse>
+
+    @POST("/api/rides/rate-passenger")
+    suspend fun ratePassenger(@Body body: RatePassengerRequest): Response<GenericSuccessResponse>
 
     // --- Stripe Connect, Fee Settlement & Gold Driver Subscription ---
     @GET("/api/driver/stripe-balance/{driverId}")

@@ -29,10 +29,12 @@ import com.example.data.network.DriverStatsPayload
 import com.example.data.network.FeeSettlementStatusResponse
 import com.example.data.network.NotificationPreferencesDto
 import com.example.data.network.PresenceHeartbeatRequest
+import com.example.data.network.RatePassengerRequest
 import com.example.data.network.ReportBlockRequest
 import com.example.data.network.RideAcceptRequest
 import com.example.data.network.RideCancelRequest
 import com.example.data.network.RideCompleteRequest
+import com.example.data.network.RideDeclineRequest
 import com.example.data.network.RideTransitionRequest
 import com.example.data.network.StripeAccountStatusResponse
 import com.example.data.network.StripeBalanceResponse
@@ -41,6 +43,7 @@ import com.example.data.network.UpdateNotificationPreferencesRequest
 import com.example.data.network.WhatsAppActivationLinkRequest
 import com.example.data.network.WhatsAppActivationLinkResponse
 import com.example.data.repository.ActiveRouteResult
+import com.example.data.repository.CockpitLocalSettings
 import com.example.data.repository.DirectionsRepository
 import com.example.data.repository.DriverFirestoreRepository
 import com.example.data.repository.DriverPreferencesStore
@@ -50,8 +53,11 @@ import com.example.service.DriverLocationSnapshot
 import com.example.service.ExternalIntentHelpers
 import com.example.service.GeocoderHelper
 import com.example.service.NetworkMonitor
+import com.example.service.OfferIntelligenceHelper
+import com.example.service.ScheduledRideReminderScheduler
 import com.example.service.UrgentPushEvent
 import com.example.service.UrgentPushEventBus
+import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -97,6 +103,13 @@ enum class TerminalRideState {
     COMPLETED_PAYMENT,
     REVIEW
 }
+
+data class ExternalNavLaunchEvent(
+    val id: Long,
+    val lat: Double,
+    val lng: Double,
+    val waypoints: List<Pair<Double, Double>> = emptyList()
+)
 
 data class DriverTerminalUiState(
     val uid: String = "",
@@ -154,13 +167,40 @@ data class DriverTerminalUiState(
     val analyticsInsight: String? = null,
     val analyticsTips: List<String> = emptyList(),
     val activeRoute: ActiveRouteResult = ActiveRouteResult(),
+    val isAutoNavHeadUp: Boolean = true,
+    val isAutoNavPaused: Boolean = false,
+    val routeRecalcLimitReached: Boolean = false,
+    val currentNavStepIndex: Int = 0,
+    val currentStepDistanceMeters: Int? = null,
+    val isActiveCardCollapsed: Boolean = true,
+    val incomingChatPopup: ChatMessage? = null,
     val isNetworkConnected: Boolean = true,
     val globalPlatformStatus: GlobalPlatformStatus = GlobalPlatformStatus(),
     val isBusy: Boolean = false,
     val toastMessage: String? = null,
     val customTabUrlToOpen: String? = null,
-    val whatsAppUrlToOpen: String? = null
+    val whatsAppUrlToOpen: String? = null,
+    // Part 2 Cockpit Features
+    val cockpitSettings: CockpitLocalSettings = CockpitLocalSettings(),
+    val pendingExternalNav: ExternalNavLaunchEvent? = null,
+    val isOnBreak: Boolean = false,
+    val breakSecondsLeft: Int = 0,
+    val breakIsOpenEnded: Boolean = false,
+    val currentSpeedMph: Int = 0,
+    val isOverSpeedAlert: Boolean = false,
+    val shiftStartedAtMs: Long? = null,
+    val shiftOnlineSeconds: Long = 0L,
+    val shiftTripsCompleted: Int = 0,
+    val shiftEarnings: Double = 0.0,
+    val shiftPaidMiles: Double = 0.0,
+    val shiftDeadheadMiles: Double = 0.0,
+    val fatigueReminderActive: Boolean = false
 ) {
+    val shiftHourlyRate: Double
+        get() = if (shiftOnlineSeconds >= 60L) {
+            (shiftEarnings / (shiftOnlineSeconds / 3600.0)).coerceAtLeast(0.0)
+        } else 0.0
+
     val totalPaidWaitSeconds: Int
         get() {
             val pickupPaid = if (rideState == TerminalRideState.WAITING) {
@@ -247,6 +287,19 @@ data class DriverTerminalUiState(
                     ).driverEarnings
                 }
         }
+
+    val yearEarningsComputed: Double
+        get() {
+            val yearAgo = System.currentTimeMillis() - 365L * 24L * 3600L * 1000L
+            return completedRides
+                .filter { maxOf(it.completedAtMs, it.createdAtMs) >= yearAgo }
+                .sumOf {
+                    resolveRideFinancialSummary(
+                        it,
+                        FallbackFareConfig(activeCommissionRate, platformConfig.fixedTripFee)
+                    ).driverEarnings
+                }
+        }
 }
 
 class DriverTerminalViewModel(application: Application) : AndroidViewModel(application) {
@@ -286,6 +339,20 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
     private var routeRecalcCount: Int = 0
     private var lastRouteFetchLat: Double = 0.0
     private var lastRouteFetchLng: Double = 0.0
+    private var lastEtaSyncMs: Long = 0L
+    private var incomingChatPopupJob: Job? = null
+    private var lastSpokenStepIndex: Int = -1
+    private val spokenStepThresholds: MutableSet<String> = mutableSetOf()
+    private var hasAnnouncedLegArrivalKey: String? = null
+    private var lastCollapsedRideState: TerminalRideState? = null
+    // Part 2 Cockpit tracking fields
+    private var breakEndsAtMs: Long? = null
+    private var lastOverSpeedAlertMs: Long = 0L
+    private var lastAutoAcceptedOfferId: String? = null
+    private var lastScheduledReminderSig: String = ""
+    private var lastDeadheadLat: Double? = null
+    private var lastDeadheadLng: Double? = null
+    private var fatigueReminderTriggeredForShift: Boolean = false
 
     init {
         startOneSecondTicker()
@@ -293,6 +360,11 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         viewModelScope.launch {
             networkMonitor.observeIsOnline().collect { online ->
                 _uiState.update { it.copy(isNetworkConnected = online) }
+            }
+        }
+        viewModelScope.launch {
+            prefsStore.cockpitSettingsFlow.collect { settings ->
+                _uiState.update { it.copy(cockpitSettings = settings) }
             }
         }
     }
@@ -417,7 +489,49 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
     private fun observeSharedLocationAndPushEvents() {
         viewModelScope.launch {
             UrgentPushEventBus.lastLocation.collect { snap ->
-                _uiState.update { it.copy(driverLocation = snap) }
+                val prev = _uiState.value
+                val speedMph = if (snap.hasRealFix) {
+                    (snap.speedMps * 2.23694f).roundToInt().coerceAtLeast(0)
+                } else 0
+                val threshold = prev.cockpitSettings.speedAlertMph
+                val isOverSpeed = threshold > 0 && speedMph > threshold
+                if (isOverSpeed) {
+                    val now = System.currentTimeMillis()
+                    if (now - lastOverSpeedAlertMs >= 45_000L) {
+                        lastOverSpeedAlertMs = now
+                        ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 90, 70, 90))
+                        audioFeedback.speakHeadsUp(
+                            "Speed alert: $speedMph miles per hour.",
+                            prev.profile.muteHeadsUpVolume
+                        )
+                    }
+                }
+                // Accumulate live deadhead mileage while heading to pickup
+                var deadheadDeltaMiles = 0.0
+                if (snap.hasRealFix && prev.rideState == TerminalRideState.EN_ROUTE_PICKUP) {
+                    val prevLat = lastDeadheadLat
+                    val prevLng = lastDeadheadLng
+                    if (prevLat != null && prevLng != null) {
+                        val movedMeters = distanceMeters(prevLat, prevLng, snap.lat, snap.lng)
+                        if (movedMeters in 5f..250f) {
+                            deadheadDeltaMiles = movedMeters / 1609.344
+                        }
+                    }
+                    lastDeadheadLat = snap.lat
+                    lastDeadheadLng = snap.lng
+                } else {
+                    lastDeadheadLat = null
+                    lastDeadheadLng = null
+                }
+
+                _uiState.update {
+                    it.copy(
+                        driverLocation = snap,
+                        currentSpeedMph = speedMph,
+                        isOverSpeedAlert = isOverSpeed,
+                        shiftDeadheadMiles = it.shiftDeadheadMiles + deadheadDeltaMiles
+                    )
+                }
                 evaluateLocationGeofences(snap)
             }
         }
@@ -426,7 +540,8 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 when (event) {
                     is UrgentPushEvent.RideOffer -> {
                         val offer = event.offer
-                        if (offer.rideId !in declinedOfferIds && _uiState.value.isOnline) {
+                        val stNow = _uiState.value
+                        if (offer.rideId !in declinedOfferIds && stNow.isOnline && !stNow.isOnBreak) {
                             val synthetic = RideRequest(
                                 id = offer.rideId,
                                 status = "pending",
@@ -589,6 +704,195 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         } else if (state.showLeaveStopReminder) {
             _uiState.update { it.copy(showLeaveStopReminder = false) }
         }
+
+        // 5. Throttled authoritative live ETA + stacked delay sync (every ~25s during active travel)
+        val nowMs = System.currentTimeMillis()
+        if ((state.rideState == TerminalRideState.EN_ROUTE_PICKUP || state.rideState == TerminalRideState.IN_PROGRESS) &&
+            (nowMs - lastEtaSyncMs >= 25_000L)
+        ) {
+            val targetLat = if (state.rideState == TerminalRideState.EN_ROUTE_PICKUP) ride.pickupLat else ride.dropoffLat
+            val targetLng = if (state.rideState == TerminalRideState.EN_ROUTE_PICKUP) ride.pickupLng else ride.dropoffLng
+            if (targetLat != 0.0 || targetLng != 0.0) {
+                val distM = distanceMeters(loc.lat, loc.lng, targetLat, targetLng)
+                if (distM < Float.MAX_VALUE) {
+                    lastEtaSyncMs = nowMs
+                    // Estimate road ETA using current speed (clamped to realistic urban/arterial 6-22 m/s, ~13-50 mph)
+                    val effectiveSpeedMps = loc.speedMps.coerceIn(7.5f, 22.0f)
+                    val liveEtaSec = ((distM * 1.25f) / effectiveSpeedMps).toInt().coerceIn(30, 14_400)
+                    val stackedDelayMins = if (state.rideState == TerminalRideState.IN_PROGRESS && state.queuedStackedRide != null) {
+                        ((liveEtaSec + 59) / 60).coerceIn(1, 60)
+                    } else null
+                    viewModelScope.launch(Dispatchers.IO) {
+                        ApiClient.safeCall {
+                            ApiClient.service.transitionRide(
+                                RideTransitionRequest(
+                                    rideId = ride.id,
+                                    action = "update_eta",
+                                    liveEtaSeconds = liveEtaSec
+                                )
+                            )
+                        }
+                        if (stackedDelayMins != null && state.queuedStackedRide != null) {
+                            ApiClient.safeCall {
+                                ApiClient.service.transitionRide(
+                                    RideTransitionRequest(
+                                        rideId = state.queuedStackedRide.id,
+                                        action = "update_eta",
+                                        stackedDriverDelay = stackedDelayMins
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. In-App Turn-by-Turn Voice Guidance & Live Step Progression (mirrors DriverTerminal.tsx)
+        evaluateTurnByTurnNavigation(loc, state, ride)
+
+        // 7. Off-route check for cost-capped Directions recalculation (max 3 per leg)
+        if ((state.rideState == TerminalRideState.EN_ROUTE_PICKUP || state.rideState == TerminalRideState.IN_PROGRESS) &&
+            state.activeRoute.points.size >= 2
+        ) {
+            val distFromRoute = minDistanceToPolylineMeters(loc.lat, loc.lng, state.activeRoute.points)
+            if (distFromRoute > 70f) {
+                refreshActiveRouteIfNeeded(ride, state.rideState)
+            }
+        }
+    }
+
+    private fun minDistanceToPolylineMeters(
+        lat: Double,
+        lng: Double,
+        points: List<com.google.android.gms.maps.model.LatLng>
+    ): Float {
+        if (points.isEmpty()) return Float.MAX_VALUE
+        var best = Float.MAX_VALUE
+        for (pt in points) {
+            val d = distanceMeters(lat, lng, pt.latitude, pt.longitude)
+            if (d < best) best = d
+        }
+        return best
+    }
+
+    private fun buildChainedStepInstruction(
+        steps: List<com.example.data.repository.RouteStep>,
+        index: Int
+    ): String {
+        val current = steps.getOrNull(index) ?: return ""
+        val next = steps.getOrNull(index + 1)
+        return if (next != null && next.distanceMeters in 1..50 && next.instruction.isNotBlank()) {
+            "${current.instruction}, then ${next.instruction}"
+        } else {
+            current.instruction
+        }
+    }
+
+    private fun evaluateTurnByTurnNavigation(
+        loc: DriverLocationSnapshot,
+        state: DriverTerminalUiState,
+        ride: RideRequest
+    ) {
+        val isDrivingLeg = state.rideState == TerminalRideState.EN_ROUTE_PICKUP ||
+            state.rideState == TerminalRideState.IN_PROGRESS
+        if (!isDrivingLeg) return
+
+        // Target leg destination for arrival voice announcement & zoom
+        val hasStop = state.rideState == TerminalRideState.IN_PROGRESS && ride.currentStopIndex < ride.stops.size
+        val activeStop = if (hasStop) ride.stops[ride.currentStopIndex] else null
+        val (targetLat, targetLng) = when {
+            state.rideState == TerminalRideState.EN_ROUTE_PICKUP -> ride.pickupLat to ride.pickupLng
+            activeStop != null && (activeStop.lat != 0.0 || activeStop.lng != 0.0) -> activeStop.lat to activeStop.lng
+            else -> ride.dropoffLat to ride.dropoffLng
+        }
+
+        val voiceEnabled = !state.profile.muteHeadsUpVolume && state.isAutoNavHeadUp
+
+        // Leg arrival announcement (<=100m to pickup / stop / destination)
+        if (targetLat != 0.0 || targetLng != 0.0) {
+            val distToTarget = distanceMeters(loc.lat, loc.lng, targetLat, targetLng)
+            val arrivalKey = "${ride.id}:${state.rideState.name}:${ride.currentStopIndex}"
+            if (distToTarget <= 100f && hasAnnouncedLegArrivalKey != arrivalKey) {
+                hasAnnouncedLegArrivalKey = arrivalKey
+                if (voiceEnabled) {
+                    val arrivalPhrase = when {
+                        state.rideState == TerminalRideState.EN_ROUTE_PICKUP ->
+                            "You have arrived at the pickup location."
+                        hasStop ->
+                            "You have arrived at stop ${ride.currentStopIndex + 1}."
+                        else ->
+                            "You have arrived at your destination."
+                    }
+                    audioFeedback.speakHeadsUp(arrivalPhrase, muteHeadsUp = false)
+                }
+                _uiState.update { it.copy(pickupZoomEventId = System.currentTimeMillis()) }
+            }
+        }
+
+        val steps = state.activeRoute.steps
+        if (steps.isEmpty()) return
+
+        var stepIdx = state.currentNavStepIndex.coerceIn(0, steps.lastIndex)
+        var distToEnd = distanceMeters(loc.lat, loc.lng, steps[stepIdx].endLat, steps[stepIdx].endLng)
+
+        // Advance past completed maneuvers (within 35m of step end or already closer to a subsequent step end)
+        while (stepIdx < steps.lastIndex && distToEnd <= 35f) {
+            stepIdx++
+            distToEnd = distanceMeters(loc.lat, loc.lng, steps[stepIdx].endLat, steps[stepIdx].endLng)
+        }
+        if (stepIdx + 1 < steps.size) {
+            val lookaheadEnd = minOf(steps.lastIndex, stepIdx + 2)
+            for (cand in (stepIdx + 1)..lookaheadEnd) {
+                val candStartDist = distanceMeters(loc.lat, loc.lng, steps[cand].startLat, steps[cand].startLng)
+                if (candStartDist <= 30f) {
+                    stepIdx = cand
+                    distToEnd = distanceMeters(loc.lat, loc.lng, steps[stepIdx].endLat, steps[stepIdx].endLng)
+                    break
+                }
+            }
+        }
+
+        val roundedDist = distToEnd.takeIf { it < Float.MAX_VALUE }?.toInt()?.coerceAtLeast(0)
+        if (stepIdx != state.currentNavStepIndex || roundedDist != state.currentStepDistanceMeters) {
+            _uiState.update {
+                it.copy(
+                    currentNavStepIndex = stepIdx,
+                    currentStepDistanceMeters = roundedDist
+                )
+            }
+        }
+
+        if (!voiceEnabled) return
+
+        // Speak current step once upon entering it
+        if (stepIdx != lastSpokenStepIndex) {
+            lastSpokenStepIndex = stepIdx
+            val spoken = buildChainedStepInstruction(steps, stepIdx)
+            if (spoken.isNotBlank()) {
+                audioFeedback.speakHeadsUp(spoken, muteHeadsUp = false)
+            }
+        }
+
+        // Prep announcements for the upcoming maneuver at 1000m, 400m, and 100m
+        val nextIdx = stepIdx + 1
+        if (nextIdx < steps.size && distToEnd < Float.MAX_VALUE) {
+            val nextPhrase = buildChainedStepInstruction(steps, nextIdx)
+            val currentStepLen = steps[stepIdx].distanceMeters
+            if (nextPhrase.isNotBlank()) {
+                when {
+                    distToEnd <= 110f && spokenStepThresholds.add("$nextIdx:100") -> {
+                        audioFeedback.speakHeadsUp("In 100 meters, $nextPhrase", muteHeadsUp = false)
+                    }
+                    distToEnd in 160f..420f && currentStepLen >= 450 && spokenStepThresholds.add("$nextIdx:400") -> {
+                        audioFeedback.speakHeadsUp("In 400 meters, $nextPhrase", muteHeadsUp = false)
+                    }
+                    distToEnd in 550f..1050f && currentStepLen >= 1100 && spokenStepThresholds.add("$nextIdx:1000") -> {
+                        audioFeedback.speakHeadsUp("In 1 kilometer, $nextPhrase", muteHeadsUp = false)
+                    }
+                }
+            }
+        }
     }
 
     private fun startOneSecondTicker() {
@@ -598,10 +902,39 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 val now = System.currentTimeMillis()
                 var triggerMissedOfferTimeout = false
                 var triggerAutoArrive = false
+                var triggerAutoResumeBreak = false
+                var triggerFatigueVoiceNudge = false
                 var expiredOfferId: String? = null
 
                 _uiState.update { state ->
                     var next = state
+                    if (state.isOnline && !state.isOnBreak) {
+                        val nextOnlineSecs = state.shiftOnlineSeconds + 1L
+                        next = next.copy(shiftOnlineSeconds = nextOnlineSecs)
+                        val fatigueHours = state.cockpitSettings.fatigueReminderHours
+                        if (fatigueHours > 0 &&
+                            !fatigueReminderTriggeredForShift &&
+                            nextOnlineSecs >= fatigueHours * 3600L
+                        ) {
+                            fatigueReminderTriggeredForShift = true
+                            next = next.copy(fatigueReminderActive = true)
+                            if (state.activeRide == null) {
+                                triggerFatigueVoiceNudge = true
+                            }
+                        }
+                    }
+                    if (state.isOnBreak && !state.breakIsOpenEnded) {
+                        val endsAt = breakEndsAtMs
+                        if (endsAt != null) {
+                            val rem = ((endsAt - now) / 1000L).toInt()
+                            if (rem <= 0) {
+                                triggerAutoResumeBreak = true
+                                next = next.copy(breakSecondsLeft = 0)
+                            } else {
+                                next = next.copy(breakSecondsLeft = rem)
+                            }
+                        }
+                    }
                     if (state.incomingOffer != null && state.rideState == TerminalRideState.OFFER) {
                         val secs = ((state.incomingOffer.expiresAtMs - now) / 1000L).toInt()
                         if (secs <= 0) {
@@ -651,6 +984,16 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 }
                 if (triggerAutoArrive) {
                     markArrivedAtPickup(isAuto = true)
+                }
+                if (triggerAutoResumeBreak) {
+                    endBreak(isAuto = true)
+                }
+                if (triggerFatigueVoiceNudge) {
+                    val hrs = _uiState.value.cockpitSettings.fatigueReminderHours
+                    audioFeedback.speakHeadsUp(
+                        "You have been driving for $hrs hours. Consider taking a short coffee break.",
+                        _uiState.value.profile.muteHeadsUpVolume
+                    )
                 }
             }
         }
@@ -867,17 +1210,35 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                             _uiState.update { it.copy(chatMessages = msgs) }
                         } else if (latestRemote != null && latestRemote.id != lastAlertedChatMsgId) {
                             lastAlertedChatMsgId = latestRemote.id
+                            val senderLabel = stateNow.activeRide?.passengerName
+                                ?.takeIf { it.isNotBlank() }
+                                ?: currentActive.passengerName
+                            // Read incoming passenger message aloud hands-free (respects Mute Voice setting)
+                            audioFeedback.speakChatMessage(
+                                senderName = senderLabel,
+                                text = latestRemote.text,
+                                hasImage = !latestRemote.imageUrl.isNullOrBlank(),
+                                muteHeadsUp = stateNow.profile.muteHeadsUpVolume
+                            )
                             if (!stateNow.showChatSheet) {
                                 audioFeedback.playChatMessageChime(stateNow.profile.muteRideOfferAlerts)
                                 ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 90, 60, 90))
                                 _uiState.update {
                                     it.copy(
                                         chatMessages = msgs,
-                                        unreadChatCount = it.unreadChatCount + 1
+                                        unreadChatCount = it.unreadChatCount + 1,
+                                        incomingChatPopup = latestRemote
                                     )
                                 }
+                                scheduleIncomingChatPopupDismiss(latestRemote.id)
                             } else {
-                                _uiState.update { it.copy(chatMessages = msgs, unreadChatCount = 0) }
+                                _uiState.update {
+                                    it.copy(
+                                        chatMessages = msgs,
+                                        unreadChatCount = 0,
+                                        incomingChatPopup = null
+                                    )
+                                }
                             }
                         } else {
                             _uiState.update { it.copy(chatMessages = msgs) }
@@ -885,11 +1246,13 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                     }
                 }
             } else {
+                incomingChatPopupJob?.cancel()
                 _uiState.update {
                     it.copy(
                         chatMessages = emptyList(),
                         unreadChatCount = 0,
-                        showChatSheet = false
+                        showChatSheet = false,
+                        incomingChatPopup = null
                     )
                 }
             }
@@ -915,17 +1278,21 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         }
 
         val latestState = _uiState.value
-        val validPending = pendingOffers
-            .filter { offer ->
-                offer.id !in declinedOfferIds &&
-                    when (offer.status.lowercase()) {
-                        "offered" -> offer.assignedDriverId == uid
-                        else -> offer.assignedDriverId.isNullOrBlank() || offer.assignedDriverId == uid
-                    }
-            }
-            // Prefer directed server-dispatched `offered` rides first
-            .sortedBy { if (it.status.equals("offered", ignoreCase = true)) 0 else 1 }
-            .firstOrNull()
+        val validPending = if (latestState.isOnBreak) {
+            null
+        } else {
+            pendingOffers
+                .filter { offer ->
+                    offer.id !in declinedOfferIds &&
+                        when (offer.status.lowercase()) {
+                            "offered" -> offer.assignedDriverId == uid
+                            else -> offer.assignedDriverId.isNullOrBlank() || offer.assignedDriverId == uid
+                        }
+                }
+                // Prefer directed server-dispatched `offered` rides first
+                .sortedBy { if (it.status.equals("offered", ignoreCase = true)) 0 else 1 }
+                .firstOrNull()
+        }
 
         val derivedRideState = when {
             latestState.rideState == TerminalRideState.REVIEW && latestState.reviewRide != null ->
@@ -936,7 +1303,7 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 "awaiting_payment", "payment_pending", "awaiting_cash_confirm", "cash_confirmed" -> TerminalRideState.COMPLETED_PAYMENT
                 else -> TerminalRideState.EN_ROUTE_PICKUP
             }
-            latestState.isOnline && validPending != null -> TerminalRideState.OFFER
+            latestState.isOnline && !latestState.isOnBreak && validPending != null -> TerminalRideState.OFFER
             else -> TerminalRideState.IDLE
         }
 
@@ -953,6 +1320,7 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
             queuedStacked == null &&
             derivedRideState == TerminalRideState.IN_PROGRESS &&
             latestState.isOnline &&
+            !latestState.isOnBreak &&
             latestState.profile.stackingEnabled &&
             !latestState.profile.lastJob &&
             validPending != null &&
@@ -992,6 +1360,38 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
             lastAlertedOfferId = null
         }
 
+        // Sync scheduled ride 45m & 15m local reminder alarms
+        val schedSig = "${latestState.cockpitSettings.scheduledRemindersEnabled}:" +
+            scheduled.joinToString(",") { "${it.id}@${it.scheduledTime.orEmpty()}" }
+        if (schedSig != lastScheduledReminderSig) {
+            lastScheduledReminderSig = schedSig
+            ScheduledRideReminderScheduler.syncReminders(
+                context = context,
+                scheduledRides = scheduled,
+                enabled = latestState.cockpitSettings.scheduledRemindersEnabled
+            )
+        }
+
+        // Compute live shift summary from completed rides since shift start (or start of day)
+        val shiftFloorMs = latestState.shiftStartedAtMs ?: Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+        val shiftCompleted = completed.filter { maxOf(it.completedAtMs, it.createdAtMs) >= shiftFloorMs }
+        val fallbackCfg = FallbackFareConfig(latestState.activeCommissionRate, latestState.platformConfig.fixedTripFee)
+        val computedShiftEarnings = shiftCompleted.sumOf {
+            resolveRideFinancialSummary(it, fallbackCfg).driverEarnings
+        }
+        val computedShiftPaidMiles = shiftCompleted.sumOf { it.distanceMiles.coerceAtLeast(0.0) }
+
+        val shouldResetCollapsed = derivedRideState != lastCollapsedRideState &&
+            derivedRideState in setOf(TerminalRideState.EN_ROUTE_PICKUP, TerminalRideState.IN_PROGRESS)
+        if (derivedRideState != lastCollapsedRideState) {
+            lastCollapsedRideState = derivedRideState
+        }
+
         _uiState.update { st ->
             st.copy(
                 activeRide = currentActive,
@@ -1004,11 +1404,54 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 paymentQrUrl = currentActive?.paymentUrl ?: st.paymentQrUrl,
                 isAwaitingCashConfirm = if (currentActive?.status?.equals("awaiting_cash_confirm", true) == true) true else st.isAwaitingCashConfirm,
                 lastRideUpdateNotice = midTripNotice,
+                isActiveCardCollapsed = if (shouldResetCollapsed) true else st.isActiveCardCollapsed,
+                isAutoNavPaused = if (shouldResetCollapsed) false else st.isAutoNavPaused,
+                shiftTripsCompleted = shiftCompleted.size,
+                shiftEarnings = computedShiftEarnings,
+                shiftPaidMiles = computedShiftPaidMiles,
                 toastMessage = if (midTripNotice != null && midTripNotice != st.lastRideUpdateNotice) midTripNotice else st.toastMessage
             )
         }
 
+        // Auto-Accept Mode evaluation (OFF by default, gated by min fare & max pickup deadhead miles)
+        val cockpit = latestState.cockpitSettings
+        if (cockpit.autoAcceptEnabled &&
+            !latestState.isOnBreak &&
+            !latestState.isBusy &&
+            nextIncoming != null &&
+            nextIncoming.id != lastAutoAcceptedOfferId
+        ) {
+            val intel = OfferIntelligenceHelper.analyze(
+                offer = nextIncoming,
+                driverLat = latestState.driverLocation.lat,
+                driverLng = latestState.driverLocation.lng,
+                hasRealDriverFix = latestState.driverLocation.hasRealFix,
+                homeLat = latestState.profile.homeLat,
+                homeLng = latestState.profile.homeLng
+            )
+            val meetsFare = nextIncoming.fareEstimate >= cockpit.autoAcceptMinFare
+            val meetsPickup = !latestState.driverLocation.hasRealFix || intel.pickupDeadheadMiles <= cockpit.autoAcceptMaxPickupMiles
+            if (meetsFare && meetsPickup) {
+                lastAutoAcceptedOfferId = nextIncoming.id
+                audioFeedback.speakHeadsUp(
+                    "Auto-accepting ride for £%.2f".format(nextIncoming.fareEstimate),
+                    latestState.profile.muteHeadsUpVolume
+                )
+                acceptOffer(isStacked = false)
+            }
+        }
+
         refreshActiveRouteIfNeeded(currentActive, derivedRideState)
+    }
+
+    private fun scheduleIncomingChatPopupDismiss(messageId: String) {
+        incomingChatPopupJob?.cancel()
+        incomingChatPopupJob = viewModelScope.launch {
+            delay(10_000L)
+            _uiState.update { st ->
+                if (st.incomingChatPopup?.id == messageId) st.copy(incomingChatPopup = null) else st
+            }
+        }
     }
 
     private fun resetPerRideTransientState() {
@@ -1020,6 +1463,22 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         hasAutoZoomedPickupRideId = null
         hasReachedCurrentStopKey = null
         dismissedStartTripReminderRideId = null
+        incomingChatPopupJob?.cancel()
+        lastSpokenStepIndex = -1
+        spokenStepThresholds.clear()
+        hasAnnouncedLegArrivalKey = null
+        routeRecalcCount = 0
+        lastRouteLegKey = null
+        _uiState.update {
+            it.copy(
+                incomingChatPopup = null,
+                routeRecalcLimitReached = false,
+                currentNavStepIndex = 0,
+                currentStepDistanceMeters = null,
+                isAutoNavPaused = false,
+                isActiveCardCollapsed = true
+            )
+        }
     }
 
     private fun refreshActiveRouteIfNeeded(ride: RideRequest?, state: TerminalRideState) {
@@ -1031,8 +1490,17 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         ) {
             lastRouteLegKey = null
             routeRecalcCount = 0
-            if (_uiState.value.activeRoute.points.isNotEmpty()) {
-                _uiState.update { it.copy(activeRoute = ActiveRouteResult()) }
+            lastSpokenStepIndex = -1
+            spokenStepThresholds.clear()
+            if (_uiState.value.activeRoute.points.isNotEmpty() || _uiState.value.routeRecalcLimitReached) {
+                _uiState.update {
+                    it.copy(
+                        activeRoute = ActiveRouteResult(),
+                        routeRecalcLimitReached = false,
+                        currentNavStepIndex = 0,
+                        currentStepDistanceMeters = null
+                    )
+                }
             }
             return
         }
@@ -1060,21 +1528,48 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         if (legKey != lastRouteLegKey) {
             lastRouteLegKey = legKey
             routeRecalcCount = 0
-        } else if (movedMeters[0] < 50f || routeRecalcCount >= 3) {
+            lastSpokenStepIndex = -1
+            spokenStepThresholds.clear()
+            _uiState.update { it.copy(routeRecalcLimitReached = false, currentNavStepIndex = 0, currentStepDistanceMeters = null) }
+        } else if (routeRecalcCount >= 3) {
+            if (!_uiState.value.routeRecalcLimitReached) {
+                _uiState.update { it.copy(routeRecalcLimitReached = true) }
+            }
+            return
+        } else if (movedMeters[0] < 50f) {
             return
         } else {
             routeRecalcCount++
+            if (routeRecalcCount >= 3) {
+                _uiState.update { it.copy(routeRecalcLimitReached = true) }
+            }
         }
 
         lastRouteFetchLat = loc.lat
         lastRouteFetchLng = loc.lng
         viewModelScope.launch {
             val route = directionsRepo.fetchRoute(loc.lat, loc.lng, destLat, destLng)
-            _uiState.update { it.copy(activeRoute = route) }
-            route.nextManeuver?.let { maneuver ->
-                if (state == TerminalRideState.EN_ROUTE_PICKUP || state == TerminalRideState.IN_PROGRESS) {
-                    audioFeedback.speakHeadsUp(maneuver, _uiState.value.profile.muteHeadsUpVolume)
-                }
+            lastSpokenStepIndex = -1
+            spokenStepThresholds.clear()
+            _uiState.update {
+                it.copy(
+                    activeRoute = route,
+                    currentNavStepIndex = 0,
+                    currentStepDistanceMeters = route.steps.firstOrNull()?.distanceMeters
+                )
+            }
+            val currentUi = _uiState.value
+            val initialSpeech = if (route.steps.isNotEmpty()) {
+                lastSpokenStepIndex = 0
+                buildChainedStepInstruction(route.steps, 0)
+            } else {
+                route.nextManeuver.orEmpty()
+            }
+            if (initialSpeech.isNotBlank() &&
+                currentUi.isAutoNavHeadUp &&
+                (state == TerminalRideState.EN_ROUTE_PICKUP || state == TerminalRideState.IN_PROGRESS)
+            ) {
+                audioFeedback.speakHeadsUp(initialSpeech, currentUi.profile.muteHeadsUpVolume)
             }
         }
     }
@@ -1118,10 +1613,14 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
     }
 
     fun setChatSheetVisible(visible: Boolean) {
+        if (visible) {
+            incomingChatPopupJob?.cancel()
+        }
         _uiState.update {
             it.copy(
                 showChatSheet = visible,
-                unreadChatCount = if (visible) 0 else it.unreadChatCount
+                unreadChatCount = if (visible) 0 else it.unreadChatCount,
+                incomingChatPopup = if (visible) null else it.incomingChatPopup
             )
         }
         val rideId = _uiState.value.activeRide?.id
@@ -1130,6 +1629,54 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         } else {
             stopChatPresence()
         }
+    }
+
+    fun dismissIncomingChatPopup() {
+        incomingChatPopupJob?.cancel()
+        _uiState.update { it.copy(incomingChatPopup = null) }
+    }
+
+    fun sendPopupQuickReply(text: String) {
+        if (text.isBlank()) return
+        incomingChatPopupJob?.cancel()
+        _uiState.update {
+            it.copy(
+                incomingChatPopup = null,
+                unreadChatCount = 0,
+                toastMessage = "Quick reply sent: \"$text\""
+            )
+        }
+        sendChatMessage(text)
+    }
+
+    fun toggleAutoNavHeadUp() {
+        _uiState.update { st ->
+            val next = !st.isAutoNavHeadUp
+            st.copy(
+                isAutoNavHeadUp = next,
+                isAutoNavPaused = false,
+                toastMessage = if (next) "3D Head-Up Navigation resumed" else "2D Map Overview mode"
+            )
+        }
+    }
+
+    fun pauseAutoNavFromGesture() {
+        if (!_uiState.value.isAutoNavPaused) {
+            _uiState.update { it.copy(isAutoNavPaused = true) }
+        }
+    }
+
+    fun resumeAutoNav() {
+        _uiState.update {
+            it.copy(
+                isAutoNavHeadUp = true,
+                isAutoNavPaused = false
+            )
+        }
+    }
+
+    fun toggleActiveCardCollapsed() {
+        _uiState.update { it.copy(isActiveCardCollapsed = !it.isActiveCardCollapsed) }
     }
 
     fun clearToast() {
@@ -1142,6 +1689,103 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
 
     fun clearWhatsAppUrl() {
         _uiState.update { it.copy(whatsAppUrlToOpen = null) }
+    }
+
+    fun clearPendingExternalNav() {
+        _uiState.update { it.copy(pendingExternalNav = null) }
+    }
+
+    // --- Part 2 Cockpit Settings, Break Mode, Fatigue & Safety Toolkit ---
+
+    fun updateCockpitSettings(transform: (CockpitLocalSettings) -> CockpitLocalSettings) {
+        viewModelScope.launch {
+            val updated = prefsStore.updateCockpitSettings(transform)
+            _uiState.update { it.copy(cockpitSettings = updated) }
+            ScheduledRideReminderScheduler.syncReminders(
+                context = context,
+                scheduledRides = _uiState.value.scheduledRides,
+                enabled = updated.scheduledRemindersEnabled
+            )
+        }
+    }
+
+    fun startBreak(durationMinutes: Int?) {
+        val state = _uiState.value
+        if (!state.isOnline) {
+            _uiState.update { it.copy(toastMessage = "Go Online first to take a shift break.") }
+            return
+        }
+        if (state.activeRide != null) {
+            _uiState.update { it.copy(toastMessage = "Finish your current ride before pausing requests.") }
+            return
+        }
+        val uid = state.uid.ifBlank { return }
+        val openEnded = durationMinutes == null || durationMinutes <= 0
+        val totalSeconds = if (openEnded) 0 else durationMinutes!! * 60
+        breakEndsAtMs = if (openEnded) null else System.currentTimeMillis() + totalSeconds * 1000L
+        fatigueReminderTriggeredForShift = false
+
+        _uiState.update {
+            it.copy(
+                isOnBreak = true,
+                breakIsOpenEnded = openEnded,
+                breakSecondsLeft = totalSeconds,
+                incomingOffer = null,
+                rideState = TerminalRideState.IDLE,
+                fatigueReminderActive = false,
+                toastMessage = if (openEnded) {
+                    "Break started — new ride requests paused."
+                } else {
+                    "$durationMinutes-min break started — requests paused."
+                }
+            )
+        }
+        ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 60))
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.setDriverBreakStatus(uid, onBreak = true)
+        }
+    }
+
+    fun endBreak(isAuto: Boolean = false) {
+        val state = _uiState.value
+        if (!state.isOnBreak) return
+        val uid = state.uid
+        breakEndsAtMs = null
+        _uiState.update {
+            it.copy(
+                isOnBreak = false,
+                breakIsOpenEnded = false,
+                breakSecondsLeft = 0,
+                toastMessage = if (isAuto) {
+                    "Break ended — you are back ONLINE for ride requests."
+                } else {
+                    "Break ended — ready for ride requests."
+                }
+            )
+        }
+        ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 70, 50, 70))
+        if (isAuto) {
+            audioFeedback.speakHeadsUp(
+                "Your break has ended. You are back online for ride requests.",
+                state.profile.muteHeadsUpVolume
+            )
+        }
+        if (uid.isNotBlank()) {
+            viewModelScope.launch(Dispatchers.IO) {
+                repository.setDriverBreakStatus(uid, onBreak = false)
+            }
+        }
+    }
+
+    fun dismissFatigueReminder() {
+        _uiState.update { it.copy(fatigueReminderActive = false) }
+    }
+
+    fun logSafetyIncident(note: String) {
+        val trimmed = note.trim()
+        if (trimmed.isBlank()) return
+        reportHazard("Safety Incident: $trimmed")
+        _uiState.update { it.copy(toastMessage = "Safety incident logged with GPS & timestamp.") }
     }
 
     // --- Online / Offline Control ---
@@ -1166,9 +1810,23 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 return
             }
             consecutiveMissedOffers = 0
+            breakEndsAtMs = null
+            fatigueReminderTriggeredForShift = false
             DriverLocationService.start(context, state.profile.fullName, state.activeRide != null)
             ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 80))
-            _uiState.update { it.copy(isOnline = true, toastMessage = "You are now ONLINE — waiting for jobs.") }
+            _uiState.update {
+                it.copy(
+                    isOnline = true,
+                    isOnBreak = false,
+                    breakSecondsLeft = 0,
+                    breakIsOpenEnded = false,
+                    shiftStartedAtMs = System.currentTimeMillis(),
+                    shiftOnlineSeconds = 0L,
+                    shiftDeadheadMiles = 0.0,
+                    fatigueReminderActive = false,
+                    toastMessage = "You are now ONLINE — waiting for jobs."
+                )
+            }
             viewModelScope.launch(Dispatchers.IO) {
                 prefsStore.setOnlineFlag(true)
                 val loc = state.driverLocation
@@ -1200,10 +1858,16 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 _uiState.update { it.copy(toastMessage = "Finish or cancel your active trip before going Offline.") }
                 return
             }
+            breakEndsAtMs = null
+            fatigueReminderTriggeredForShift = false
             DriverLocationService.stop(context)
             _uiState.update {
                 it.copy(
                     isOnline = false,
+                    isOnBreak = false,
+                    breakSecondsLeft = 0,
+                    breakIsOpenEnded = false,
+                    fatigueReminderActive = false,
                     incomingOffer = null,
                     rideState = TerminalRideState.IDLE,
                     toastMessage = "You are now OFFLINE."
@@ -1232,11 +1896,22 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                     if (isStacked && uid.isNotBlank()) {
                         repository.syncActiveRideDropoff(uid, offer.dropoffLat, offer.dropoffLng)
                     }
+                    val autoNavEvent = if (!isStacked &&
+                        _uiState.value.cockpitSettings.autoLaunchExternalNav &&
+                        (offer.pickupLat != 0.0 || offer.pickupLng != 0.0)
+                    ) {
+                        ExternalNavLaunchEvent(
+                            id = System.currentTimeMillis(),
+                            lat = offer.pickupLat,
+                            lng = offer.pickupLng
+                        )
+                    } else null
                     _uiState.update {
                         it.copy(
                             isBusy = false,
                             incomingOffer = if (!isStacked) null else it.incomingOffer,
                             stackedRideOffer = if (isStacked) null else it.stackedRideOffer,
+                            pendingExternalNav = autoNavEvent ?: it.pendingExternalNav,
                             toastMessage = if (isStacked) "Next ride queued! Finish current trip first." else "Ride accepted! Navigating to pickup."
                         )
                     }
@@ -1276,11 +1951,22 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                                     )
                                 }
                             }
+                            val autoNavEvent = if (!isStacked &&
+                                _uiState.value.cockpitSettings.autoLaunchExternalNav &&
+                                (offer.pickupLat != 0.0 || offer.pickupLng != 0.0)
+                            ) {
+                                ExternalNavLaunchEvent(
+                                    id = System.currentTimeMillis(),
+                                    lat = offer.pickupLat,
+                                    lng = offer.pickupLng
+                                )
+                            } else null
                             _uiState.update {
                                 it.copy(
                                     isBusy = false,
                                     incomingOffer = if (!isStacked) null else it.incomingOffer,
                                     stackedRideOffer = if (isStacked) null else it.stackedRideOffer,
+                                    pendingExternalNav = autoNavEvent ?: it.pendingExternalNav,
                                     toastMessage = if (isStacked) "Next ride queued! Finish current trip first." else "Ride accepted! Navigating to pickup."
                                 )
                             }
@@ -1307,9 +1993,13 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         if (offer == null) return
         consecutiveMissedOffers = 0
         val uid = _uiState.value.uid
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             prefsStore.addDeclinedOfferId(offer.id)
-            if (uid.isNotBlank()) {
+            // Call server-authoritative POST /api/rides/decline for instant re-dispatch; fall back safely if unavailable
+            val res = ApiClient.safeCall {
+                ApiClient.service.declineRide(RideDeclineRequest(rideId = offer.id))
+            }
+            if (res is ApiResult.Error && uid.isNotBlank()) {
                 repository.recordDriverDeclineStatus(uid)
             }
         }
@@ -1361,17 +2051,23 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 }
             ) {
                 is ApiResult.Success -> {
+                    val currentProfile = _uiState.value.profile
                     waitingStartedAtMs = System.currentTimeMillis()
+                    audioFeedback.playArrivalConfirmChime(currentProfile.muteRideOfferAlerts)
                     ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 120, 60, 120))
-                    // Trigger fast 5-second critical offline WhatsApp fallback on rider arrival!
+                    audioFeedback.speakHeadsUp(
+                        if (isAuto) "Auto-marked arrived outside. Passenger notified." else "Marked arrived outside. Passenger notified.",
+                        currentProfile.muteHeadsUpVolume
+                    )
+                    // Trigger fast 5-second critical offline WhatsApp fallback + audible push on rider arrival!
                     if (ride.passengerId.isNotBlank()) {
                         ApiClient.safeCall {
                             ApiClient.service.sendChatPush(
                                 ChatPushRequest(
                                     rideId = ride.id,
                                     recipientId = ride.passengerId,
-                                    title = "Your AnyRoller driver has arrived",
-                                    message = "${_uiState.value.profile.fullName} is waiting at pickup.",
+                                    title = "Your AnyRoller driver has arrived outside",
+                                    message = "${currentProfile.fullName} has arrived outside at your pickup point.",
                                     type = "ride_arrived"
                                 )
                             )
@@ -1382,7 +2078,7 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                             isBusy = false,
                             rideState = TerminalRideState.WAITING,
                             pickupZoomEventId = System.currentTimeMillis(),
-                            toastMessage = if (isAuto) "Auto-marked arrived at pickup. Passenger notified." else "Marked arrived. Passenger notified."
+                            toastMessage = if (isAuto) "Auto-marked arrived outside. Passenger notified." else "Marked arrived outside. Passenger notified."
                         )
                     }
                 }
@@ -1435,6 +2131,19 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                             )
                         }
                     }
+                    val remainingWaypoints = ride.stops
+                        .drop(ride.currentStopIndex.coerceAtLeast(0))
+                        .map { it.lat to it.lng }
+                    val autoNavEvent = if (_uiState.value.cockpitSettings.autoLaunchExternalNav &&
+                        (ride.dropoffLat != 0.0 || ride.dropoffLng != 0.0)
+                    ) {
+                        ExternalNavLaunchEvent(
+                            id = System.currentTimeMillis(),
+                            lat = ride.dropoffLat,
+                            lng = ride.dropoffLng,
+                            waypoints = remainingWaypoints
+                        )
+                    } else null
                     _uiState.update {
                         it.copy(
                             isBusy = false,
@@ -1445,6 +2154,7 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                             isWaitingAtStop = false,
                             currentStopWaitSeconds = 0,
                             abandonmentWarningSent = false,
+                            pendingExternalNav = autoNavEvent ?: it.pendingExternalNav,
                             toastMessage = "Trip started — drive safely."
                         )
                     }
@@ -1932,13 +2642,15 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         viewModelScope.launch {
             _uiState.update { it.copy(isBusy = true) }
             if (ride.passengerId.isNotBlank()) {
-                repository.submitPassengerRating(
-                    rideId = ride.id,
-                    driverId = state.uid,
-                    passengerId = ride.passengerId,
-                    rating = stars,
-                    comment = comment
-                )
+                ApiClient.safeCall {
+                    ApiClient.service.ratePassenger(
+                        RatePassengerRequest(
+                            rideId = ride.id,
+                            rating = stars.coerceIn(1, 5),
+                            comment = comment.trim().takeIf { it.isNotBlank() }
+                        )
+                    )
+                }
             }
             val nextQueued = _uiState.value.queuedStackedRide ?: _uiState.value.activeRide?.takeIf { it.id != ride.id }
             if (nextQueued != null && state.uid.isNotBlank()) {
@@ -2272,7 +2984,13 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         }
     }
 
-    fun addExpense(amount: Double, category: String, notes: String, receiptUri: Uri?) {
+    fun addExpense(
+        amount: Double,
+        category: String,
+        notes: String,
+        receiptUri: Uri?,
+        date: String? = null
+    ) {
         val uid = _uiState.value.uid.ifBlank { return }
         if (amount <= 0.0) {
             _uiState.update { it.copy(toastMessage = "Please enter a valid expense amount.") }
@@ -2288,9 +3006,46 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                     return@launch
                 }
             }
-            val dateStr = SimpleDateFormat("yyyy-MM-dd", Locale.UK).format(Date())
+            val dateStr = date?.trim()?.takeIf { Regex("^\\d{4}-\\d{2}-\\d{2}$").matches(it) }
+                ?: SimpleDateFormat("yyyy-MM-dd", Locale.UK).format(Date())
             repository.addDriverExpense(uid, amount, category, dateStr, notes, receiptUrl)
             _uiState.update { it.copy(isBusy = false, toastMessage = "Expense logged.") }
+        }
+    }
+
+    fun updateExpense(
+        expenseId: String,
+        amount: Double,
+        category: String,
+        date: String,
+        notes: String,
+        newReceiptUri: Uri?,
+        existingReceiptUrl: String?
+    ) {
+        val uid = _uiState.value.uid.ifBlank { return }
+        if (amount <= 0.0) {
+            _uiState.update { it.copy(toastMessage = "Please enter a valid expense amount.") }
+            return
+        }
+        viewModelScope.launch {
+            _uiState.update { it.copy(isBusy = true) }
+            var receiptUrl = existingReceiptUrl
+            if (newReceiptUri != null) {
+                val up = repository.uploadVerificationDoc(uid, "expense_receipt", newReceiptUri)
+                receiptUrl = up.getOrElse { err ->
+                    _uiState.update { it.copy(isBusy = false, toastMessage = err.message) }
+                    return@launch
+                }
+            }
+            val dateStr = date.trim().takeIf { Regex("^\\d{4}-\\d{2}-\\d{2}$").matches(it) }
+                ?: SimpleDateFormat("yyyy-MM-dd", Locale.UK).format(Date())
+            val res = repository.updateDriverExpense(expenseId, amount, category, dateStr, notes, receiptUrl)
+            _uiState.update {
+                it.copy(
+                    isBusy = false,
+                    toastMessage = if (res.isSuccess) "Expense updated." else (res.exceptionOrNull()?.message ?: "Unable to update expense.")
+                )
+            }
         }
     }
 

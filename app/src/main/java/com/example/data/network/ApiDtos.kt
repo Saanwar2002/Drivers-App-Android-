@@ -31,9 +31,15 @@ data class MaintenanceStatusResponse(
 @JsonClass(generateAdapter = true)
 data class AcceptTermsRequest(
     val termsVersion: String,
-    val privacyVersion: String = termsVersion,
+    val compulsoryAgreed: Boolean = true,
     val marketingOptIn: Boolean = false,
     val partnerDataSharingOptIn: Boolean = false
+)
+
+@Keep
+@JsonClass(generateAdapter = true)
+data class DeleteAccountRequest(
+    val confirmationText: String = "DELETE"
 )
 
 @Keep
@@ -230,12 +236,28 @@ data class RideAcceptRequest(
 
 @Keep
 @JsonClass(generateAdapter = true)
+data class RideDeclineRequest(
+    val rideId: String
+)
+
+@Keep
+@JsonClass(generateAdapter = true)
 data class RideTransitionRequest(
     val rideId: String,
-    val action: String, // arrived | in_progress | stop_progress | early_completion_reason
+    val action: String, // arrived | in_progress | stop_progress | early_completion_reason | update_eta
     val paidWaitSeconds: Int? = null,
     val currentStopIndex: Int? = null,
-    val earlyCompletionReason: String? = null
+    val earlyCompletionReason: String? = null,
+    val liveEtaSeconds: Int? = null,
+    val stackedDriverDelay: Int? = null
+)
+
+@Keep
+@JsonClass(generateAdapter = true)
+data class RatePassengerRequest(
+    val rideId: String,
+    val rating: Int,
+    val comment: String? = null
 )
 
 @Keep

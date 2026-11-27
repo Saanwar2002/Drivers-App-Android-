@@ -104,12 +104,61 @@ class DriverAudioFeedback(context: Context) {
     }
 
     /**
+     * Plays a crisp 2-tone ascending confirmation chime when the driver marks Arrived Outside.
+     */
+    fun playArrivalConfirmChime(muteOfferAlerts: Boolean) {
+        if (muteOfferAlerts) return
+        scope.launch {
+            runCatching {
+                val tg = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85)
+                try {
+                    tg.startTone(ToneGenerator.TONE_PROP_ACK, 180)
+                    delay(210L)
+                    tg.startTone(ToneGenerator.TONE_PROP_BEEP2, 220)
+                    delay(250L)
+                } finally {
+                    tg.release()
+                }
+            }
+        }
+    }
+
+    /**
      * Speaks concise UK English heads-up driving announcements unless `muteHeadsUp` is enabled.
      */
     fun speakHeadsUp(text: String, muteHeadsUp: Boolean) {
         if (muteHeadsUp || !ttsReady || text.isBlank()) return
         runCatching {
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "anyroller_hud_${System.currentTimeMillis()}")
+        }
+    }
+
+    /**
+     * Reads an incoming passenger chat message aloud hands-free using QUEUE_ADD so
+     * rapid back-to-back messages do not cut each other off. Respects `muteHeadsUp`.
+     */
+    fun speakChatMessage(
+        senderName: String,
+        text: String?,
+        hasImage: Boolean,
+        muteHeadsUp: Boolean
+    ) {
+        if (muteHeadsUp || !ttsReady) return
+        val firstName = senderName
+            .trim()
+            .split(" ")
+            .firstOrNull()
+            ?.takeIf { it.isNotBlank() && !it.equals("passenger", ignoreCase = true) }
+            ?: "passenger"
+        val cleanText = text?.trim()?.replace(Regex("\\s+"), " ")?.take(220).orEmpty()
+        val spoken = when {
+            hasImage && cleanText.isNotBlank() -> "Photo message from $firstName: $cleanText"
+            hasImage -> "$firstName sent a photo."
+            cleanText.isNotBlank() -> "Message from $firstName: $cleanText"
+            else -> return
+        }
+        runCatching {
+            tts?.speak(spoken, TextToSpeech.QUEUE_ADD, null, "anyroller_chat_${System.currentTimeMillis()}")
         }
     }
 

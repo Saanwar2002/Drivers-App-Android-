@@ -183,7 +183,7 @@ class DriverFirestoreRepository(private val context: Context) {
                     date = snap.getString("date") ?: "",
                     onlineSecondsToday = snap.getLong("onlineSecondsToday")
                         ?: snap.getLong("onlineSeconds") ?: 0L,
-                    ridesToday = (snap.getLong("ridesToday") ?: 0L).toInt(),
+                    ridesToday = (snap.getLong("ridesToday") ?: snap.getLong("jobsDoneToday") ?: 0L).toInt(),
                     earningsToday = snap.getDouble("dailyEarnings")
                         ?: snap.getDouble("earningsToday") ?: 0.0,
                     lifetimeRides = (snap.getLong("lifetimeRides") ?: snap.getLong("totalRides") ?: 0L).toInt(),
@@ -198,7 +198,7 @@ class DriverFirestoreRepository(private val context: Context) {
 
     fun observePendingRideOffers(): Flow<List<RideRequest>> = callbackFlow {
         val reg = db.collection("ride_requests")
-            .whereIn("status", listOf("offered", "pending"))
+            .whereIn("status", listOf("offered", "pending", "searching"))
             .limit(25)
             .addSnapshotListener { snap, error ->
                 if (error != null) {
@@ -629,6 +629,33 @@ class DriverFirestoreRepository(private val context: Context) {
         }
     }
 
+    /**
+     * Toggles temporary Coffee Break / Pause New Requests without stopping GPS tracking or ending shift streak.
+     * Marks `driver_status/{uid}` as `busy` (preventing new dispatch offers) and restores `online` on resume.
+     */
+    suspend fun setDriverBreakStatus(uid: String, onBreak: Boolean): Result<Unit> {
+        return safeFirestoreWrite("setDriverBreakStatus", "driver_status/$uid") {
+            db.collection("driver_status").document(uid)
+                .set(
+                    mapOf(
+                        "status" to if (onBreak) "busy" else "online",
+                        "isBusy" to onBreak,
+                        "onBreak" to onBreak,
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                ).await()
+            db.collection("live_tracking").document(uid)
+                .set(
+                    mapOf(
+                        "status" to if (onBreak) "busy" else "available",
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                ).await()
+        }
+    }
+
     suspend fun activateQueuedRideInLiveTracking(
         uid: String,
         rideId: String,
@@ -729,7 +756,9 @@ class DriverFirestoreRepository(private val context: Context) {
                 .set(
                     mapOf(
                         "driverId" to uid,
+                        "online" to false,
                         "isOnline" to false,
+                        "isBusy" to false,
                         "status" to "offline",
                         "updatedAt" to FieldValue.serverTimestamp()
                     ),
@@ -815,6 +844,27 @@ class DriverFirestoreRepository(private val context: Context) {
         if (!receiptImage.isNullOrBlank()) payload["receiptImage"] = receiptImage
         return safeFirestoreWrite("addDriverExpense", "driver_expenses") {
             db.collection("driver_expenses").add(payload).await()
+        }
+    }
+
+    suspend fun updateDriverExpense(
+        expenseId: String,
+        amount: Double,
+        category: String,
+        date: String,
+        notes: String,
+        receiptImage: String?
+    ): Result<Unit> {
+        val payload = hashMapOf<String, Any>(
+            "amount" to amount,
+            "category" to category,
+            "date" to date,
+            "notes" to notes.trim(),
+            "updatedAt" to FieldValue.serverTimestamp()
+        )
+        if (!receiptImage.isNullOrBlank()) payload["receiptImage"] = receiptImage
+        return safeFirestoreWrite("updateDriverExpense", "driver_expenses/$expenseId") {
+            db.collection("driver_expenses").document(expenseId).update(payload).await()
         }
     }
 
@@ -976,6 +1026,11 @@ class DriverFirestoreRepository(private val context: Context) {
             ?.filter { it.isNotBlank() }
             ?: listOf(doc.getString("vehicleCategory") ?: "standard")
 
+        val rawCapabilities = (doc.get("capabilities") as? List<*>)
+            ?.mapNotNull { it?.toString()?.trim() }
+            ?.filter { it.isNotBlank() }
+            .orEmpty()
+
         return DriverProfile(
             uid = doc.id,
             firstName = doc.getString("firstName") ?: "",
@@ -987,6 +1042,7 @@ class DriverFirestoreRepository(private val context: Context) {
             photoURL = doc.getString("photoURL"),
             role = doc.getString("role") ?: "",
             accountType = doc.getString("accountType") ?: "",
+            capabilities = rawCapabilities,
             isDriverFlag = doc.getBoolean("isDriver") ?: false,
             driverApproved = doc.getBoolean("driverApproved") ?: false,
             disabled = doc.getBoolean("disabled") ?: false,
@@ -1009,6 +1065,17 @@ class DriverFirestoreRepository(private val context: Context) {
             referralCode = doc.getString("referralCode") ?: "AR-${doc.id.take(6).uppercase()}",
             vehicleCategory = doc.getString("vehicleCategory") ?: rawCategories.firstOrNull() ?: "standard",
             vehicleCategories = rawCategories,
+            vehicleMake = doc.getString("vehicleMake") ?: "",
+            vehicleModel = doc.getString("vehicleModel") ?: doc.getString("carModel") ?: "",
+            vehicleColor = doc.getString("vehicleColor") ?: "",
+            vehicleInfo = doc.getString("vehicleInfo") ?: "",
+            vehiclePlate = doc.getString("vehiclePlate")
+                ?: doc.getString("licensePlate")
+                ?: doc.getString("registrationPlate")
+                ?: doc.getString("plateNumber")
+                ?: "",
+            totalBusinessMileage = doc.getDouble("totalBusinessMileage") ?: 0.0,
+            proFeaturesEnabled = doc.getBoolean("proFeaturesEnabled") ?: false,
             petFriendly = doc.getBoolean("isPetFriendly") ?: false,
             stackingEnabled = doc.getBoolean("isStackingEnabled") ?: true,
             lastJob = doc.getBoolean("isLastJob") ?: false,
@@ -1114,7 +1181,7 @@ class DriverFirestoreRepository(private val context: Context) {
             surgeMultiplier = doc.getDouble("surgeMultiplier") ?: 1.0,
             surgeModel = doc.getString("surgeModel") ?: "multiplier",
             surgeFixedAmount = doc.getDouble("surgeFixedAmount") ?: doc.getDouble("surgeFixed") ?: 0.0,
-            vehicleCategory = doc.getString("vehicleCategory") ?: "standard",
+            vehicleCategory = doc.getString("vehicleCategory") ?: doc.getString("carCategory") ?: "standard",
             distanceMiles = doc.getDouble("distanceMiles") ?: doc.getDouble("distance") ?: 0.0,
             durationMinutes = (doc.getLong("durationMinutes") ?: doc.getLong("etaMinutes") ?: 0L).toInt(),
             paymentMethod = doc.getString("paymentMethod") ?: "card",
@@ -1144,6 +1211,8 @@ class DriverFirestoreRepository(private val context: Context) {
             isModifiedByPassenger = doc.getBoolean("isModifiedByPassenger") ?: false,
             cancelledBy = doc.getString("cancelledBy"),
             cancellationFee = doc.getDouble("cancellationFee") ?: 0.0,
+            priorityFee = doc.getDouble("priorityFee") ?: 0.0,
+            abandonmentFee = doc.getDouble("abandonmentFee") ?: 0.0,
             cashCollected = doc.getDouble("cashCollected"),
             unpaidBalance = doc.getDouble("unpaidBalance") ?: 0.0
         )

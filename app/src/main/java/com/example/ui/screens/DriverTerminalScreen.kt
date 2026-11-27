@@ -2,18 +2,26 @@ package com.example.ui.screens
 
 import android.Manifest
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.BatteryManager
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -32,6 +40,9 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.BatteryChargingFull
 import androidx.compose.material.icons.rounded.BatteryStd
@@ -42,15 +53,24 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Construction
 import androidx.compose.material.icons.rounded.CurrencyPound
 import androidx.compose.material.icons.rounded.Emergency
+import androidx.compose.material.icons.rounded.Explore
+import androidx.compose.material.icons.rounded.LocalCafe
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.MyLocation
 import androidx.compose.material.icons.rounded.Navigation
 import androidx.compose.material.icons.rounded.NoCrash
 import androidx.compose.material.icons.rounded.Schedule
+import androidx.compose.material.icons.rounded.ShareLocation
+import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Traffic
 import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material.icons.rounded.WrongLocation
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
@@ -89,6 +109,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.service.ExternalIntentHelpers
+import com.example.service.GeocoderHelper
+import java.util.Calendar
 import com.example.ui.theme.ANYROLLER_DARK_MAP_STYLE_JSON
 import com.example.ui.theme.AnyRollerBgPrimary
 import com.example.ui.theme.AnyRollerBgSecondary
@@ -113,6 +135,7 @@ import com.google.android.gms.maps.model.BitmapDescriptorFactory
 import com.google.android.gms.maps.model.CameraPosition
 import com.google.android.gms.maps.model.LatLng
 import com.google.android.gms.maps.model.MapStyleOptions
+import com.google.maps.android.compose.CameraMoveStartedReason
 import com.google.maps.android.compose.Circle
 import com.google.maps.android.compose.GoogleMap
 import com.google.maps.android.compose.MapProperties
@@ -135,8 +158,8 @@ fun DriverTerminalRoot(
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
 
-    // Keep screen awake while driver is Online or on an active trip
-    val keepScreenAwake = state.isOnline || state.activeRide != null
+    // Keep screen awake while driver is Online or on an active trip (respecting driver cockpit setting)
+    val keepScreenAwake = (state.isOnline || state.activeRide != null) && state.cockpitSettings.keepScreenAwake
     DisposableEffect(context, keepScreenAwake) {
         val window = (context as? Activity)?.window
         if (keepScreenAwake) {
@@ -171,6 +194,19 @@ fun DriverTerminalRoot(
             ExternalIntentHelpers.launchValidatedWhatsAppUrl(context, waUrl)
             viewModel.clearWhatsAppUrl()
         }
+    }
+
+    // Auto-Launch External Navigation (ON by default, toggleable OFF in Settings)
+    LaunchedEffect(state.pendingExternalNav?.id) {
+        val navEvent = state.pendingExternalNav ?: return@LaunchedEffect
+        ExternalIntentHelpers.launchTurnByTurnNavigation(
+            context = context,
+            lat = navEvent.lat,
+            lng = navEvent.lng,
+            preferredNavApp = state.profile.defaultNavApp,
+            waypoints = navEvent.waypoints
+        )
+        viewModel.clearPendingExternalNav()
     }
 
     val hasLocationPermission = remember {
@@ -312,11 +348,20 @@ fun DriverTerminalRoot(
                 )
             }
 
-            // Modals & Chat Sheet
+            // Modals & Chat Sheet (Safety Toolkit lives cleanly inside Hazard/SOS Modal — zero extra map buttons)
             if (state.showHazardModal) {
                 ReportHazardAndSosModal(
+                    driverLat = state.driverLocation.lat,
+                    driverLng = state.driverLocation.lng,
+                    hasRealFix = state.driverLocation.hasRealFix,
+                    activeRide = state.activeRide,
+                    emergencyContactPhone = state.cockpitSettings.emergencyContactPhone,
                     onDismiss = { viewModel.setHazardModalVisible(false) },
                     onSubmitHazard = { viewModel.reportHazard(it) },
+                    onLogSafetyIncident = { note ->
+                        viewModel.logSafetyIncident(note)
+                        viewModel.setHazardModalVisible(false)
+                    },
                     onEmergencySos = {
                         viewModel.setHazardModalVisible(false)
                         ExternalIntentHelpers.dialPhoneNumber(context, "999")
@@ -350,28 +395,91 @@ private fun TerminalMapCockpit(
         position = CameraPosition.fromLatLngZoom(driverLatLng, 14f)
     }
 
+    val isDrivingLeg = state.rideState == TerminalRideState.EN_ROUTE_PICKUP ||
+        state.rideState == TerminalRideState.IN_PROGRESS
+
     LaunchedEffect(state.driverLocation.hasRealFix) {
-        if (state.driverLocation.hasRealFix) {
+        if (state.driverLocation.hasRealFix && !isDrivingLeg) {
             cameraPositionState.animate(
                 CameraUpdateFactory.newLatLngZoom(driverLatLng, 15f)
             )
         }
     }
 
-    // Smooth street-level zoom (18f) when approaching within 200m of pickup or marking arrived
-    LaunchedEffect(state.pickupZoomEventId) {
-        val ride = state.activeRide
-        if (state.pickupZoomEventId > 0L && ride != null && (ride.pickupLat != 0.0 || ride.pickupLng != 0.0)) {
+    // Pause 3D Head-Up auto-follow if driver manually pans/zooms the map
+    LaunchedEffect(cameraPositionState.isMoving, cameraPositionState.cameraMoveStartedReason, isDrivingLeg) {
+        if (isDrivingLeg &&
+            cameraPositionState.isMoving &&
+            cameraPositionState.cameraMoveStartedReason == CameraMoveStartedReason.GESTURE
+        ) {
+            viewModel.pauseAutoNavFromGesture()
+        }
+    }
+
+    // 3D Head-Up Navigation Camera (mirrors DriverTerminal.tsx isAutoNavHeadUp + bearing/tilt)
+    LaunchedEffect(
+        state.driverLocation.lat,
+        state.driverLocation.lng,
+        state.driverLocation.heading,
+        state.isAutoNavHeadUp,
+        state.isAutoNavPaused,
+        isDrivingLeg
+    ) {
+        if (isDrivingLeg && state.isAutoNavHeadUp && !state.isAutoNavPaused && state.driverLocation.hasRealFix) {
+            val targetBearing = if (state.driverLocation.speedMps > 1.2f) {
+                state.driverLocation.heading
+            } else {
+                cameraPositionState.position.bearing
+            }
             cameraPositionState.animate(
-                CameraUpdateFactory.newLatLngZoom(LatLng(ride.pickupLat, ride.pickupLng), 18f)
+                update = CameraUpdateFactory.newCameraPosition(
+                    CameraPosition.Builder()
+                        .target(driverLatLng)
+                        .zoom(17.5f)
+                        .tilt(45f)
+                        .bearing(targetBearing)
+                        .build()
+                ),
+                durationMs = 700
             )
         }
     }
 
+    // Smooth street-level zoom (18f) when approaching within 200m of pickup / stop / dropoff or marking arrived
+    LaunchedEffect(state.pickupZoomEventId) {
+        val ride = state.activeRide
+        if (state.pickupZoomEventId > 0L && ride != null) {
+            val (zLat, zLng) = if (state.rideState == TerminalRideState.IN_PROGRESS) {
+                val activeStop = ride.stops.getOrNull(ride.currentStopIndex)
+                if (activeStop != null && (activeStop.lat != 0.0 || activeStop.lng != 0.0)) {
+                    activeStop.lat to activeStop.lng
+                } else {
+                    ride.dropoffLat to ride.dropoffLng
+                }
+            } else {
+                ride.pickupLat to ride.pickupLng
+            }
+            if (zLat != 0.0 || zLng != 0.0) {
+                cameraPositionState.animate(
+                    CameraUpdateFactory.newLatLngZoom(LatLng(zLat, zLng), 18f)
+                )
+            }
+        }
+    }
+
     val darkMapStyle = remember { MapStyleOptions(ANYROLLER_DARK_MAP_STYLE_JSON) }
+    val systemDark = isSystemInDarkTheme()
+    val useDarkMap = when (state.cockpitSettings.mapThemeMode.lowercase()) {
+        "dark" -> true
+        "light" -> false
+        else -> {
+            val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+            systemDark || hour < 7 || hour >= 19
+        }
+    }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // 1. Full-bleed Dark Google Map (1:1 mirror of DriverTerminal.tsx full-screen map)
+        // 1. Full-bleed Google Map (Auto-Night / Dark / Daylight high-contrast theme)
         GoogleMap(
             modifier = Modifier
                 .fillMaxSize()
@@ -379,7 +487,7 @@ private fun TerminalMapCockpit(
             cameraPositionState = cameraPositionState,
             properties = MapProperties(
                 isMyLocationEnabled = hasLocationPermission,
-                mapStyleOptions = darkMapStyle,
+                mapStyleOptions = if (useDarkMap) darkMapStyle else null,
                 isTrafficEnabled = true
             ),
             uiSettings = MapUiSettings(
@@ -500,8 +608,24 @@ private fun TerminalMapCockpit(
                 }
                 else -> state.activeRide.pickupAddress
             }
-            val liveInstruction = state.activeRoute.nextManeuver?.takeIf { it.isNotBlank() } ?: targetAddress
+            val liveStepInstruction = state.activeRoute.steps
+                .getOrNull(state.currentNavStepIndex)
+                ?.instruction
+                ?.takeIf { it.isNotBlank() }
+            val liveInstruction = liveStepInstruction
+                ?: state.activeRoute.nextManeuver?.takeIf { it.isNotBlank() }
+                ?: targetAddress
+            val stepDistLabel = state.currentStepDistanceMeters?.let { meters ->
+                when {
+                    meters >= 1000 -> "%.1f km".format(meters / 1000.0)
+                    meters >= 50 -> "${((meters + 25) / 50) * 50} m"
+                    else -> "$meters m"
+                }
+            }
             val liveDistanceLabel = buildString {
+                if (!stepDistLabel.isNullOrBlank() && state.rideState != TerminalRideState.WAITING) {
+                    append("Next turn $stepDistLabel • ")
+                }
                 val distText = state.activeRoute.distanceText
                 val etaMins = state.activeRoute.etaMinutes
                 if (!distText.isNullOrBlank() && etaMins != null) {
@@ -511,11 +635,15 @@ private fun TerminalMapCockpit(
                 } else {
                     append("Live GPS Active")
                 }
+                if (state.driverLocation.hasRealFix && state.rideState != TerminalRideState.WAITING) {
+                    append(" • ${state.currentSpeedMph} mph")
+                }
             }
             LockedNavigationHud(
                 heading = navHeading,
                 instruction = liveInstruction,
                 distanceLabel = liveDistanceLabel,
+                isOverSpeedAlert = state.isOverSpeedAlert,
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .statusBarsPadding()
@@ -642,28 +770,80 @@ private fun TerminalMapCockpit(
                 }
             }
 
-            // Recenter Map GPS Button
+            // Recenter / 3D Head-Up Navigation Camera Toggle Button (mirrors DriverTerminal.tsx)
+            val headUpActive = isDrivingLeg && state.isAutoNavHeadUp && !state.isAutoNavPaused
+            val headUpPaused = isDrivingLeg && state.isAutoNavPaused
             Surface(
                 onClick = {
-                    scope.launch {
-                        cameraPositionState.animate(
-                            CameraUpdateFactory.newLatLngZoom(driverLatLng, 15f)
-                        )
+                    if (isDrivingLeg) {
+                        if (state.isAutoNavPaused) {
+                            viewModel.resumeAutoNav()
+                        } else {
+                            val willEnableHeadUp = !state.isAutoNavHeadUp
+                            viewModel.toggleAutoNavHeadUp()
+                            if (!willEnableHeadUp) {
+                                scope.launch {
+                                    cameraPositionState.animate(
+                                        CameraUpdateFactory.newCameraPosition(
+                                            CameraPosition.Builder()
+                                                .target(driverLatLng)
+                                                .zoom(15f)
+                                                .tilt(0f)
+                                                .bearing(0f)
+                                                .build()
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        scope.launch {
+                            cameraPositionState.animate(
+                                CameraUpdateFactory.newCameraPosition(
+                                    CameraPosition.Builder()
+                                        .target(driverLatLng)
+                                        .zoom(15f)
+                                        .tilt(0f)
+                                        .bearing(0f)
+                                        .build()
+                                )
+                            )
+                        }
                     }
                 },
                 shape = CircleShape,
-                color = AnyRollerBgSecondary,
+                color = when {
+                    headUpPaused -> AnyRollerOrange.copy(alpha = 0.22f)
+                    headUpActive -> AnyRollerGreen.copy(alpha = 0.22f)
+                    else -> AnyRollerBgSecondary
+                },
                 modifier = Modifier
                     .size(48.dp)
-                    .border(1.dp, AnyRollerBorder, CircleShape)
+                    .border(
+                        width = if (headUpActive || headUpPaused) 1.5.dp else 1.dp,
+                        color = when {
+                            headUpPaused -> AnyRollerOrange
+                            headUpActive -> AnyRollerGreen
+                            else -> AnyRollerBorder
+                        },
+                        shape = CircleShape
+                    )
                     .testTag("recenter_map_button")
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
-                        imageVector = Icons.Rounded.MyLocation,
-                        contentDescription = "Recenter Map",
-                        tint = AnyRollerTextPrimary,
-                        modifier = Modifier.size(20.dp)
+                        imageVector = if (headUpActive) Icons.Rounded.Explore else Icons.Rounded.MyLocation,
+                        contentDescription = when {
+                            headUpPaused -> "Resume 3D Head-Up Navigation"
+                            headUpActive -> "Switch to 2D North-Up Overview"
+                            else -> "Recenter Map"
+                        },
+                        tint = when {
+                            headUpPaused -> AnyRollerOrange
+                            headUpActive -> AnyRollerGreen
+                            else -> AnyRollerTextPrimary
+                        },
+                        modifier = Modifier.size(21.dp)
                     )
                 }
             }
@@ -675,6 +855,11 @@ private fun TerminalMapCockpit(
                 offer = state.stackedRideOffer,
                 secondsLeft = state.stackedOfferSecondsLeft,
                 isBusy = state.isBusy,
+                driverLat = state.driverLocation.lat,
+                driverLng = state.driverLocation.lng,
+                hasRealDriverFix = state.driverLocation.hasRealFix,
+                homeLat = state.profile.homeLat,
+                homeLng = state.profile.homeLng,
                 onAccept = { viewModel.acceptOffer(isStacked = true) },
                 onDecline = { viewModel.declineOffer(isStacked = true) },
                 modifier = Modifier
@@ -684,19 +869,100 @@ private fun TerminalMapCockpit(
             )
         }
 
+        var showBreakPickerDialog by remember { mutableStateOf(false) }
+
         // 5. Floating Bottom Status Pill (Idle) OR Active Trip / Offer Overlays
         when (state.rideState) {
             TerminalRideState.IDLE -> {
-                FloatingOnlineStatusPill(
-                    isOnline = state.isOnline,
-                    isNetworkConnected = state.isNetworkConnected,
-                    todayEarnings = state.todayEarningsComputed,
-                    ridesToday = state.metrics.ridesToday,
-                    onToggleOnline = onToggleOnline,
+                Column(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(horizontal = 16.dp, vertical = 14.dp)
-                )
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    // Subtle Fatigue Break Reminder (ONLY when IDLE, never over active ride map)
+                    if (state.fatigueReminderActive && state.isOnline && !state.isOnBreak) {
+                        Surface(
+                            color = AnyRollerBgSecondary.copy(alpha = 0.96f),
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .border(1.dp, AnyRollerOrange.copy(alpha = 0.7f), RoundedCornerShape(16.dp))
+                                .testTag("idle_fatigue_reminder_banner")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                    Icon(Icons.Rounded.LocalCafe, contentDescription = null, tint = AnyRollerOrange, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        text = "${state.cockpitSettings.fatigueReminderHours}h shift check-in — take a 15m coffee break?",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = AnyRollerTextPrimary
+                                    )
+                                }
+                                TextButton(onClick = { viewModel.startBreak(15) }) {
+                                    Text("Break", color = AnyRollerOrange, fontWeight = FontWeight.Bold)
+                                }
+                                IconButton(onClick = { viewModel.dismissFatigueReminder() }, modifier = Modifier.size(32.dp)) {
+                                    Icon(Icons.Rounded.Close, contentDescription = "Dismiss fatigue reminder", tint = AnyRollerTextMuted, modifier = Modifier.size(16.dp))
+                                }
+                            }
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        FloatingOnlineStatusPill(
+                            isOnline = state.isOnline,
+                            isOnBreak = state.isOnBreak,
+                            breakSecondsLeft = state.breakSecondsLeft,
+                            breakIsOpenEnded = state.breakIsOpenEnded,
+                            isNetworkConnected = state.isNetworkConnected,
+                            todayEarnings = state.todayEarningsComputed,
+                            ridesToday = state.metrics.ridesToday,
+                            onToggleOnline = {
+                                if (state.isOnBreak) viewModel.endBreak() else onToggleOnline()
+                            },
+                            modifier = Modifier.weight(1f)
+                        )
+
+                        // Coffee Cup / Pause New Requests button (IDLE ONLY — hidden during active rides)
+                        if (state.isOnline) {
+                            Surface(
+                                onClick = {
+                                    if (state.isOnBreak) viewModel.endBreak() else showBreakPickerDialog = true
+                                },
+                                shape = CircleShape,
+                                color = if (state.isOnBreak) AnyRollerOrange else AnyRollerBgSecondary.copy(alpha = 0.96f),
+                                modifier = Modifier
+                                    .size(56.dp)
+                                    .border(
+                                        width = 1.5.dp,
+                                        color = if (state.isOnBreak) AnyRollerOrange else AnyRollerBorder,
+                                        shape = CircleShape
+                                    )
+                                    .testTag("coffee_break_button")
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.LocalCafe,
+                                        contentDescription = if (state.isOnBreak) "Resume from Coffee Break" else "Take a Coffee Break",
+                                        tint = if (state.isOnBreak) AnyRollerBgPrimary else AnyRollerOrange,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
             }
             TerminalRideState.OFFER -> {
                 state.incomingOffer?.let { offer ->
@@ -705,6 +971,11 @@ private fun TerminalMapCockpit(
                         secondsLeft = state.offerSecondsLeft,
                         totalSeconds = state.platformConfig.dispatchTimeoutSeconds,
                         isBusy = state.isBusy,
+                        driverLat = state.driverLocation.lat,
+                        driverLng = state.driverLocation.lng,
+                        hasRealDriverFix = state.driverLocation.hasRealFix,
+                        homeLat = state.profile.homeLat,
+                        homeLng = state.profile.homeLng,
                         onAccept = { viewModel.acceptOffer(isStacked = false) },
                         onDecline = { viewModel.declineOffer(isStacked = false) },
                         modifier = Modifier
@@ -717,14 +988,68 @@ private fun TerminalMapCockpit(
             TerminalRideState.WAITING,
             TerminalRideState.IN_PROGRESS -> {
                 state.activeRide?.let { ride ->
-                    ActiveTripSheetCard(
-                        ride = ride,
-                        state = state,
-                        viewModel = viewModel,
+                    Column(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
-                            .padding(horizontal = 12.dp, vertical = 12.dp)
-                    )
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        // 3-Recalc Limit Warning Banner (mirrors DriverTerminal.tsx:4899 — zero map center clutter)
+                        AnimatedVisibility(
+                            visible = state.routeRecalcLimitReached,
+                            enter = fadeIn() + slideInVertically { it / 2 },
+                            exit = fadeOut() + slideOutVertically { it / 2 }
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(AnyRollerBgSecondary.copy(alpha = 0.96f))
+                                    .border(1.dp, AnyRollerOrange.copy(alpha = 0.8f), RoundedCornerShape(14.dp))
+                                    .padding(horizontal = 12.dp, vertical = 9.dp)
+                                    .testTag("route_recalc_limit_banner"),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.WarningAmber,
+                                    contentDescription = null,
+                                    tint = AnyRollerOrange,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    text = "Auto-reroute limit reached (3/3) — tap the blue Nav button for live turn-by-turn.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = AnyRollerTextPrimary,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
+
+                        // Floating 10-Second Incoming Chat Quick-Reply Popup (mirrors DriverTerminal.tsx:4794-4848)
+                        AnimatedVisibility(
+                            visible = state.incomingChatPopup != null && !state.showChatSheet,
+                            enter = fadeIn() + slideInVertically { it / 2 },
+                            exit = fadeOut() + slideOutVertically { it / 2 }
+                        ) {
+                            state.incomingChatPopup?.let { popupMsg ->
+                                IncomingChatQuickReplyPopup(
+                                    passengerName = ride.passengerName,
+                                    message = popupMsg,
+                                    onOpenChat = { viewModel.setChatSheetVisible(true) },
+                                    onQuickReply = { reply -> viewModel.sendPopupQuickReply(reply) },
+                                    onDismiss = { viewModel.dismissIncomingChatPopup() }
+                                )
+                            }
+                        }
+
+                        ActiveTripSheetCard(
+                            ride = ride,
+                            state = state,
+                            viewModel = viewModel
+                        )
+                    }
                 }
             }
             TerminalRideState.COMPLETED_PAYMENT -> {
@@ -754,18 +1079,66 @@ private fun TerminalMapCockpit(
                 }
             }
         }
+        if (showBreakPickerDialog) {
+            AlertDialog(
+                onDismissRequest = { showBreakPickerDialog = false },
+                containerColor = AnyRollerBgSecondary,
+                title = { Text("Take a Coffee Break", color = AnyRollerTextPrimary) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            "Pause incoming ride requests without ending your shift streak.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = AnyRollerTextMuted
+                        )
+                        listOf(
+                            15 to "15 Minute Break (Auto-Resumes)",
+                            30 to "30 Minute Break (Auto-Resumes)",
+                            null to "Open Break (Resume Manually)"
+                        ).forEach { (mins, label) ->
+                            Surface(
+                                onClick = {
+                                    viewModel.startBreak(mins)
+                                    showBreakPickerDialog = false
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                color = AnyRollerBgPrimary,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .border(1.dp, AnyRollerBorder, RoundedCornerShape(12.dp))
+                                    .testTag("break_duration_${mins ?: "open"}")
+                            ) {
+                                Text(
+                                    text = label,
+                                    color = AnyRollerTextPrimary,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.padding(14.dp)
+                                )
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showBreakPickerDialog = false }) {
+                        Text("Cancel", color = AnyRollerTextMuted)
+                    }
+                }
+            )
+        }
     }
 }
 
 /**
  * Owner-Locked Navigation HUD:
  * Transparent background (NO black box), #2563EB text, #FFFFFF 90% drop shadow, zero text stroke.
+ * Live speed integrates cleanly into the distance/ETA line without adding extra map chrome.
  */
 @Composable
 private fun LockedNavigationHud(
     heading: String,
     instruction: String,
     distanceLabel: String,
+    isOverSpeedAlert: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val hudShadow = Shadow(
@@ -803,7 +1176,7 @@ private fun LockedNavigationHud(
                 fontFamily = SpaceGroteskFont,
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 14.sp,
-                color = LockedHudBlueText,
+                color = if (isOverSpeedAlert) AnyRollerRed else LockedHudBlueText,
                 shadow = hudShadow
             )
         )
@@ -816,31 +1189,60 @@ private fun BatteryStatusPill(context: Context) {
     var pct by remember { mutableIntStateOf(bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)?.coerceIn(0, 100) ?: 100) }
     var charging by remember { mutableStateOf(bm?.isCharging ?: false) }
 
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(30_000L)
-            pct = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)?.coerceIn(0, 100) ?: pct
-            charging = bm?.isCharging ?: charging
+    // Live BroadcastReceiver for instantaneous charging & battery level updates (mirrors BatteryStatus.tsx)
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                if (intent == null) return
+                val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
+                if (level >= 0) {
+                    pct = ((level * 100f) / scale).toInt().coerceIn(0, 100)
+                }
+                val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                    status == BatteryManager.BATTERY_STATUS_FULL
+            }
+        }
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        val sticky = context.registerReceiver(receiver, filter)
+        if (sticky != null) {
+            receiver.onReceive(context, sticky)
+        }
+        onDispose {
+            runCatching { context.unregisterReceiver(receiver) }
         }
     }
 
+    val lowBatteryPulse = rememberInfiniteTransition(label = "lowBatteryPulse")
+    val pulseAlpha by lowBatteryPulse.animateFloat(
+        initialValue = 0.4f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(tween(750), RepeatMode.Reverse),
+        label = "lowBatteryAlpha"
+    )
+
+    val isCritical = !charging && pct <= 20
     val tint = when {
         charging -> AnyRollerGreen
-        pct <= 20 -> AnyRollerRed
-        else -> AnyRollerTextPrimary
+        pct <= 20 -> AnyRollerRed.copy(alpha = pulseAlpha)
+        pct <= 50 -> AnyRollerOrange
+        else -> AnyRollerGreen
     }
+    val borderColor = if (isCritical) AnyRollerRed.copy(alpha = 0.75f) else AnyRollerBorder
 
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(16.dp))
             .background(AnyRollerBgSecondary.copy(alpha = 0.92f))
-            .border(1.dp, AnyRollerBorder, RoundedCornerShape(16.dp))
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .border(1.dp, borderColor, RoundedCornerShape(16.dp))
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+            .testTag("battery_status_pill"),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(
             imageVector = if (charging) Icons.Rounded.BatteryChargingFull else Icons.Rounded.BatteryStd,
-            contentDescription = "Battery $pct percent",
+            contentDescription = "Battery $pct percent${if (charging) ", charging" else ""}",
             tint = tint,
             modifier = Modifier.size(14.dp)
         )
@@ -848,6 +1250,7 @@ private fun BatteryStatusPill(context: Context) {
         Text(
             text = "$pct%",
             style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
             color = tint
         )
     }
@@ -856,6 +1259,9 @@ private fun BatteryStatusPill(context: Context) {
 @Composable
 private fun FloatingOnlineStatusPill(
     isOnline: Boolean,
+    isOnBreak: Boolean = false,
+    breakSecondsLeft: Int = 0,
+    breakIsOpenEnded: Boolean = false,
     isNetworkConnected: Boolean,
     todayEarnings: Double,
     ridesToday: Int,
@@ -872,18 +1278,27 @@ private fun FloatingOnlineStatusPill(
 
     val containerBg = when {
         !isNetworkConnected -> AnyRollerBgSecondary.copy(alpha = 0.96f)
+        isOnBreak -> AnyRollerBgSecondary.copy(alpha = 0.96f)
         isOnline -> AnyRollerGreenDeep.copy(alpha = 0.88f)
         else -> AnyRollerBgSecondary.copy(alpha = 0.94f)
     }
     val borderColor = when {
         !isNetworkConnected -> AnyRollerOrange.copy(alpha = 0.85f)
+        isOnBreak -> AnyRollerOrange.copy(alpha = 0.85f)
         isOnline -> AnyRollerGreen.copy(alpha = 0.65f)
         else -> AnyRollerBorder
     }
     val dotColor = when {
         !isNetworkConnected -> AnyRollerOrange.copy(alpha = pulseAlpha)
+        isOnBreak -> AnyRollerOrange.copy(alpha = pulseAlpha)
         isOnline -> AnyRollerGreen.copy(alpha = pulseAlpha)
         else -> AnyRollerTextMuted
+    }
+
+    val breakTimerStr = if (breakIsOpenEnded) {
+        "Open break"
+    } else {
+        "%02d:%02d left".format(breakSecondsLeft / 60, breakSecondsLeft % 60)
     }
 
     Surface(
@@ -898,7 +1313,7 @@ private fun FloatingOnlineStatusPill(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 18.dp, vertical = 14.dp),
+                .padding(horizontal = 16.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
@@ -914,25 +1329,26 @@ private fun FloatingOnlineStatusPill(
                     Text(
                         text = when {
                             !isNetworkConnected -> "NO SIGNAL — RETRYING"
+                            isOnBreak -> "ON BREAK — PAUSED"
                             isOnline -> "WAITING FOR JOBS"
                             else -> "OFFLINE"
                         },
                         style = MaterialTheme.typography.titleMedium,
-                        color = if (!isNetworkConnected) AnyRollerOrange else AnyRollerTextPrimary,
+                        color = if (!isNetworkConnected || isOnBreak) AnyRollerOrange else AnyRollerTextPrimary,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = if (!isNetworkConnected) {
-                            "Reconnecting to live dispatch • Today: £%.2f".format(todayEarnings)
-                        } else {
-                            "Today: £%.2f • %d trips • Tap to %s".format(
+                        text = when {
+                            !isNetworkConnected -> "Reconnecting to live dispatch • Today: £%.2f".format(todayEarnings)
+                            isOnBreak -> "$breakTimerStr • Tap to Resume Requests"
+                            else -> "Today: £%.2f • %d trips • Tap to %s".format(
                                 todayEarnings,
                                 ridesToday,
                                 if (isOnline) "Go Offline" else "Go Online"
                             )
                         },
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (isOnline && isNetworkConnected) AnyRollerTextPrimary.copy(alpha = 0.8f) else AnyRollerTextMuted,
+                        color = if (isOnline && !isOnBreak && isNetworkConnected) AnyRollerTextPrimary.copy(alpha = 0.8f) else AnyRollerTextMuted,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -947,6 +1363,7 @@ private fun FloatingOnlineStatusPill(
                     .background(
                         when {
                             !isNetworkConnected -> AnyRollerOrange.copy(alpha = 0.2f)
+                            isOnBreak -> AnyRollerOrange
                             isOnline -> AnyRollerGreen
                             else -> AnyRollerBorder
                         }
@@ -956,6 +1373,7 @@ private fun FloatingOnlineStatusPill(
                 Text(
                     text = when {
                         !isNetworkConnected -> "OFFLINE"
+                        isOnBreak -> "RESUME"
                         isOnline -> "ACTIVE"
                         else -> "STANDBY"
                     },
@@ -963,6 +1381,7 @@ private fun FloatingOnlineStatusPill(
                     fontWeight = FontWeight.ExtraBold,
                     color = when {
                         !isNetworkConnected -> AnyRollerOrange
+                        isOnBreak -> AnyRollerBgPrimary
                         isOnline -> AnyRollerBgPrimary
                         else -> AnyRollerTextPrimary
                     }
@@ -1076,16 +1495,23 @@ private fun BottomNavPillItem(
 }
 
 /**
- * Exact 1:1 mirror of `DriverTerminal.tsx` white rounded-3xl "Report road issue" modal:
- * 3x2 grid (Accident, Traffic, Construction, Road Closure, Speed Trap, Incorrect Route)
- * with 3-second fill countdown & tap-to-cancel + prominent red EMERGENCY SOS (999) button.
+ * Exact 1:1 mirror of `DriverTerminal.tsx` white rounded-3xl "Report road issue" modal
+ * enhanced with the 1-Tap Safety Toolkit (Live UK GPS Address, Share Live Trip/Location, Quick Incident Log)
+ * housed cleanly inside this modal so ZERO extra buttons clutter the active ride map.
  */
 @Composable
 private fun ReportHazardAndSosModal(
+    driverLat: Double,
+    driverLng: Double,
+    hasRealFix: Boolean,
+    activeRide: com.example.data.model.RideRequest?,
+    emergencyContactPhone: String,
     onDismiss: () -> Unit,
     onSubmitHazard: (String) -> Unit,
+    onLogSafetyIncident: (String) -> Unit,
     onEmergencySos: () -> Unit
 ) {
+    val context = LocalContext.current
     val options = remember {
         listOf(
             "Accident" to Icons.Rounded.CarCrash,
@@ -1098,6 +1524,15 @@ private fun ReportHazardAndSosModal(
     }
     var selectedType by remember { mutableStateOf<String?>(null) }
     var countdownMs by remember { mutableIntStateOf(3000) }
+    var incidentNote by remember { mutableStateOf("") }
+    var showIncidentInput by remember { mutableStateOf(false) }
+    var resolvedAddress by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(driverLat, driverLng, hasRealFix) {
+        if (hasRealFix && (driverLat != 0.0 || driverLng != 0.0)) {
+            resolvedAddress = GeocoderHelper.reverseGeocode(context, driverLat, driverLng)
+        }
+    }
 
     LaunchedEffect(selectedType) {
         val current = selectedType ?: return@LaunchedEffect
@@ -1128,6 +1563,7 @@ private fun ReportHazardAndSosModal(
             Column(
                 modifier = Modifier
                     .navigationBarsPadding()
+                    .verticalScroll(rememberScrollState())
                     .padding(20.dp)
             ) {
                 Row(
@@ -1136,7 +1572,7 @@ private fun ReportHazardAndSosModal(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "Report road issue",
+                        text = "Road Issue & Safety Toolkit",
                         style = MaterialTheme.typography.titleLarge,
                         color = Color(0xFF111114),
                         fontWeight = FontWeight.Bold
@@ -1147,12 +1583,35 @@ private fun ReportHazardAndSosModal(
                 }
 
                 if (selectedType != null) {
-                    Text(
-                        text = "Reporting $selectedType in ${(countdownMs / 1000) + 1}s — tap tile again to cancel",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = AnyRollerBlue,
-                        fontWeight = FontWeight.SemiBold
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Reporting $selectedType in ${(countdownMs / 1000) + 1}s…",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = AnyRollerBlue,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Surface(
+                            onClick = { selectedType = null },
+                            shape = RoundedCornerShape(12.dp),
+                            color = AnyRollerRed.copy(alpha = 0.14f),
+                            modifier = Modifier
+                                .border(1.dp, AnyRollerRed.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
+                                .testTag("cancel_hazard_countdown_button")
+                        ) {
+                            Text(
+                                text = "CANCEL",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = AnyRollerRed,
+                                fontWeight = FontWeight.ExtraBold,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
                     Spacer(Modifier.height(6.dp))
                     LinearProgressIndicator(
                         progress = { 1f - (countdownMs / 3000f) },
@@ -1168,7 +1627,7 @@ private fun ReportHazardAndSosModal(
                     Spacer(Modifier.height(8.dp))
                 }
 
-                // 3x2 Grid
+                // 3x2 Road Hazard Grid
                 for (rowIdx in 0 until 2) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1185,7 +1644,7 @@ private fun ReportHazardAndSosModal(
                                 color = if (isSelected) AnyRollerBlue.copy(alpha = 0.14f) else Color(0xFFF3F4F6),
                                 modifier = Modifier
                                     .weight(1f)
-                                    .height(92.dp)
+                                    .height(86.dp)
                                     .border(
                                         width = if (isSelected) 2.dp else 1.dp,
                                         color = if (isSelected) AnyRollerBlue else Color(0xFFE5E7EB),
@@ -1202,9 +1661,9 @@ private fun ReportHazardAndSosModal(
                                         imageVector = icon,
                                         contentDescription = label,
                                         tint = if (isSelected) AnyRollerBlue else Color(0xFF1F2937),
-                                        modifier = Modifier.size(28.dp)
+                                        modifier = Modifier.size(26.dp)
                                     )
-                                    Spacer(Modifier.height(6.dp))
+                                    Spacer(Modifier.height(5.dp))
                                     Text(
                                         text = label,
                                         style = MaterialTheme.typography.labelSmall,
@@ -1218,7 +1677,108 @@ private fun ReportHazardAndSosModal(
                     Spacer(Modifier.height(10.dp))
                 }
 
-                Spacer(Modifier.height(8.dp))
+                // Safety Toolkit Section (Live GPS for 999, Share Live Location, Quick Incident Log)
+                Surface(
+                    color = Color(0xFFF8FAFC),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(16.dp))
+                ) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.Shield, contentDescription = null, tint = AnyRollerBlue, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = "Driver Safety Toolkit",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = Color(0xFF0F172A),
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        val gpsDisplay = resolvedAddress?.takeIf { it.isNotBlank() }
+                            ?: if (hasRealFix) "%.5f, %.5f".format(driverLat, driverLng) else "Acquiring live GPS…"
+                        Text(
+                            text = "Current Location: $gpsDisplay",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFF334155)
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                            OutlinedButton(
+                                onClick = {
+                                    val mapsUrl = "https://maps.google.com/?q=$driverLat,$driverLng"
+                                    val tripInfo = activeRide?.let {
+                                        "\nActive Trip: ${it.pickupAddress} → ${it.dropoffAddress}"
+                                    } ?: ""
+                                    val contactNote = emergencyContactPhone.takeIf { it.isNotBlank() }?.let {
+                                        "\nEmergency Contact: $it"
+                                    } ?: ""
+                                    val shareBody = "AnyRoller Driver Live Location Share\nLocation: $gpsDisplay\nMap: $mapsUrl$tripInfo$contactNote"
+                                    ExternalIntentHelpers.shareText(
+                                        context = context,
+                                        subject = "My Live Location — AnyRoller Driver",
+                                        text = shareBody
+                                    )
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(48.dp)
+                                    .testTag("safety_share_live_location_button")
+                            ) {
+                                Icon(Icons.Rounded.ShareLocation, contentDescription = null, tint = AnyRollerBlue, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Share Location", color = Color(0xFF0F172A), maxLines = 1)
+                            }
+                            OutlinedButton(
+                                onClick = { showIncidentInput = !showIncidentInput },
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(48.dp)
+                                    .testTag("safety_toggle_incident_log_button")
+                            ) {
+                                Text(if (showIncidentInput) "Hide Note" else "Log Incident", color = Color(0xFF0F172A), maxLines = 1)
+                            }
+                        }
+
+                        if (showIncidentInput) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                OutlinedTextField(
+                                    value = incidentNote,
+                                    onValueChange = { incidentNote = it },
+                                    placeholder = { Text("Brief safety note…") },
+                                    singleLine = true,
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedTextColor = Color(0xFF0F172A),
+                                        unfocusedTextColor = Color(0xFF0F172A)
+                                    ),
+                                    modifier = Modifier.weight(1f).testTag("safety_incident_note_input")
+                                )
+                                Button(
+                                    onClick = {
+                                        if (incidentNote.isNotBlank()) {
+                                            onLogSafetyIncident(incidentNote)
+                                            incidentNote = ""
+                                            showIncidentInput = false
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = AnyRollerBlue, contentColor = Color.White),
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.height(48.dp).testTag("safety_save_incident_button")
+                                ) {
+                                    Text("Log", fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
                 Button(
                     onClick = onEmergencySos,
                     colors = ButtonDefaults.buttonColors(containerColor = AnyRollerRed, contentColor = Color.White),

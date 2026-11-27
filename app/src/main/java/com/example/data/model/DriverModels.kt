@@ -41,6 +41,7 @@ data class DriverProfile(
     val photoURL: String? = null,
     val role: String = "",
     val accountType: String = "",
+    val capabilities: List<String> = emptyList(),
     val isDriverFlag: Boolean = false,
     val driverApproved: Boolean = false,
     val disabled: Boolean = false,
@@ -63,6 +64,13 @@ data class DriverProfile(
     val referralCode: String = "",
     val vehicleCategory: String = "standard",
     val vehicleCategories: List<String> = listOf("standard"),
+    val vehicleMake: String = "",
+    val vehicleModel: String = "",
+    val vehicleColor: String = "",
+    val vehicleInfo: String = "",
+    val vehiclePlate: String = "",
+    val totalBusinessMileage: Double = 0.0,
+    val proFeaturesEnabled: Boolean = false,
     val petFriendly: Boolean = false,
     val stackingEnabled: Boolean = true,
     val lastJob: Boolean = false,
@@ -95,12 +103,24 @@ data class DriverProfile(
     val isGoldDriver: Boolean
         get() = subscriptionType == "driver_gold" || earningsReportExport
 
+    val hasProTaxAccess: Boolean
+        get() = proFeaturesEnabled || isGoldDriver
+
+    val resolvedVehicleTitle: String
+        get() = vehicleInfo.takeIf { it.isNotBlank() }
+            ?: listOf(vehicleColor, vehicleMake, vehicleModel)
+                .filter { it.isNotBlank() }
+                .joinToString(" ")
+                .ifBlank { "Active PHV Vehicle" }
+
     fun hasDriverRole(): Boolean {
         val r = role.lowercase()
         val at = accountType.lowercase()
+        val caps = capabilities.map { it.lowercase() }
         return r in setOf("driver", "fleet_driver", "taxi_driver") ||
             isDriverFlag ||
-            at == "driver"
+            at == "driver" ||
+            caps.any { it in setOf("driver", "fleet_driver", "taxi_driver") }
     }
 
     fun isAccountSuspendedOrDisabled(): Boolean {
@@ -185,6 +205,8 @@ data class RideRequest(
     val isModifiedByPassenger: Boolean = false,
     val cancelledBy: String? = null,
     val cancellationFee: Double = 0.0,
+    val priorityFee: Double = 0.0,
+    val abandonmentFee: Double = 0.0,
     val cashCollected: Double? = null,
     val unpaidBalance: Double = 0.0
 )

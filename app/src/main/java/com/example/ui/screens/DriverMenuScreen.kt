@@ -35,11 +35,13 @@ import androidx.compose.material.icons.rounded.CalendarMonth
 import androidx.compose.material.icons.rounded.Campaign
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Description
+import androidx.compose.material.icons.rounded.DirectionsCar
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.HelpOutline
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.LocalCafe
 import androidx.compose.material.icons.rounded.Map
 import androidx.compose.material.icons.rounded.Navigation
 import androidx.compose.material.icons.rounded.NotificationsActive
@@ -47,6 +49,7 @@ import androidx.compose.material.icons.rounded.Payments
 import androidx.compose.material.icons.rounded.Percent
 import androidx.compose.material.icons.rounded.ReceiptLong
 import androidx.compose.material.icons.rounded.Share
+import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.Storefront
 import androidx.compose.material.icons.rounded.Timer
@@ -105,11 +108,14 @@ import com.example.viewmodel.DriverTerminalUiState
 import com.example.viewmodel.DriverTerminalViewModel
 
 /**
- * Upgraded Driver Menu mirroring `DriverMenu.tsx` + `OfflineAlertsCard.tsx`:
- * - Keeps all action alerts (Stripe setup, pending fees, Admin broadcasts, driving-hours bar)
- *   cleanly inside the Menu so the live Map Window stays 100% clutter-free.
- * - Dynamic Admin `vehicleTypes` tiers, UK geocoded Home Destination, collapsible secondary
- *   settings, live Platform Fee rate, and AnyTrader Ecosystem shortcuts.
+ * Logically grouped & ordered AnyRoller Driver Menu & Settings:
+ * 0. Profile + Live "This Shift" Summary + Daily Driving Hours Safety Bar + Action Banners
+ * 1. Shift & Dispatch Controls (Coffee Break, Stack Next Ride, Last Job, Destination Mode, Auto-Accept)
+ * 2. Navigation & Cockpit Display (Auto-Launch External Nav [ON by default], Nav App, Map Theme, PiP, Screen Awake, Brightness Boost)
+ * 3. Safety, Audio & Alerts (PIN Passcode, Over-Speed Alert, Fatigue Reminder, Emergency Contact, Audio Mutes, Scheduled Alarms, WhatsApp Fallback)
+ * 4. Vehicle & Service Tiers (Pet-Friendly, Admin Vehicle Tiers, Live Commission Rate)
+ * 5. Operations & Business (Documents, Weekly Availability, Zones & Radar, Analytics, Expenses & Tax)
+ * 6. AnyTrader Ecosystem & Account (Marketplace, Mechanic Quotes, Help, Refer a Driver, Sign Out)
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -122,11 +128,17 @@ fun DriverMenuScreen(
 ) {
     val context = LocalContext.current
     val profile = state.profile
+    val cockpit = state.cockpitSettings
+
     var showHomeModal by remember { mutableStateOf(false) }
-    var showNavAppModal by remember { mutableStateOf(false) }
     var pendingToggleConfirm by remember { mutableStateOf<Triple<String, String, () -> Unit>?>(null) }
-    var showAdvancedPrefs by remember { mutableStateOf(false) }
+
+    // Logical collapsible sections
+    var expandNavCockpit by remember { mutableStateOf(true) } // Expanded by default so Auto-Launch toggle is immediately accessible
+    var expandSafetyAudio by remember { mutableStateOf(false) }
+    var expandVehicleTiers by remember { mutableStateOf(false) }
     var showWhatsAppCard by remember { mutableStateOf(!state.notificationPrefs.whatsappWindowActive) }
+    var emergencyPhoneDraft by remember(cockpit.emergencyContactPhone) { mutableStateOf(cockpit.emergencyContactPhone) }
 
     val batteryOptimized = remember { !ExternalIntentHelpers.isIgnoringBatteryOptimizations(context) }
 
@@ -139,6 +151,10 @@ fun DriverMenuScreen(
         else -> AnyRollerGreen
     }
 
+    val shiftHrs = state.shiftOnlineSeconds / 3600L
+    val shiftMins = (state.shiftOnlineSeconds % 3600L) / 60L
+    val shiftDurationText = if (shiftHrs > 0L) "${shiftHrs}h ${shiftMins}m" else "${shiftMins}m"
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -146,7 +162,7 @@ fun DriverMenuScreen(
             .statusBarsPadding()
             .navigationBarsPadding()
     ) {
-        // Header with Quick Online / Offline Toggle
+        // Header with Quick Online / Break / Offline Toggle
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -154,18 +170,21 @@ fun DriverMenuScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("Driver Menu", style = MaterialTheme.typography.headlineSmall, color = AnyRollerTextPrimary)
+            Text("Driver Menu & Settings", style = MaterialTheme.typography.titleLarge, color = AnyRollerTextPrimary, fontWeight = FontWeight.Bold)
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val pillColor = when {
+                    state.isOnBreak -> AnyRollerOrange
+                    state.isOnline -> AnyRollerGreen
+                    else -> AnyRollerTextMuted
+                }
                 Surface(
-                    onClick = onToggleOnline,
+                    onClick = {
+                        if (state.isOnBreak) viewModel.endBreak() else onToggleOnline()
+                    },
                     shape = RoundedCornerShape(18.dp),
-                    color = if (state.isOnline) AnyRollerGreen.copy(alpha = 0.2f) else AnyRollerBgSecondary,
+                    color = if (state.isOnline) pillColor.copy(alpha = 0.2f) else AnyRollerBgSecondary,
                     modifier = Modifier
-                        .border(
-                            1.dp,
-                            if (state.isOnline) AnyRollerGreen else AnyRollerBorder,
-                            RoundedCornerShape(18.dp)
-                        )
+                        .border(1.dp, if (state.isOnline) pillColor else AnyRollerBorder, RoundedCornerShape(18.dp))
                         .testTag("menu_online_toggle_pill")
                 ) {
                     Row(
@@ -176,14 +195,18 @@ fun DriverMenuScreen(
                             modifier = Modifier
                                 .size(8.dp)
                                 .clip(CircleShape)
-                                .background(if (state.isOnline) AnyRollerGreen else AnyRollerTextMuted)
+                                .background(pillColor)
                         )
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            text = if (state.isOnline) "ONLINE" else "OFFLINE",
+                            text = when {
+                                state.isOnBreak -> "BREAK"
+                                state.isOnline -> "ONLINE"
+                                else -> "OFFLINE"
+                            },
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.ExtraBold,
-                            color = if (state.isOnline) AnyRollerGreen else AnyRollerTextPrimary
+                            color = if (state.isOnline) pillColor else AnyRollerTextPrimary
                         )
                     }
                 }
@@ -200,7 +223,9 @@ fun DriverMenuScreen(
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            // Driver Profile Header Card + Daily Driving Hours Safety Bar
+            // =====================================================================
+            // 0. PROFILE, LIVE SHIFT SUMMARY & DAILY DRIVING HOURS BAR
+            // =====================================================================
             Surface(
                 onClick = { viewModel.openOverlay(DriverOverlayRoute.PROFILE) },
                 color = AnyRollerBgSecondary,
@@ -217,17 +242,17 @@ fun DriverMenuScreen(
                                 model = profile.photoURL,
                                 contentDescription = "Driver Avatar",
                                 contentScale = ContentScale.Crop,
-                                modifier = Modifier.size(56.dp).clip(CircleShape)
+                                modifier = Modifier.size(54.dp).clip(CircleShape)
                             )
                         } else {
                             Box(
-                                modifier = Modifier.size(56.dp).clip(CircleShape).background(AnyRollerGreen.copy(alpha = 0.2f)),
+                                modifier = Modifier.size(54.dp).clip(CircleShape).background(AnyRollerGreen.copy(alpha = 0.2f)),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(profile.initials, style = MaterialTheme.typography.titleLarge, color = AnyRollerGreen)
                             }
                         }
-                        Spacer(Modifier.width(14.dp))
+                        Spacer(Modifier.width(12.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(profile.fullName, style = MaterialTheme.typography.titleMedium, color = AnyRollerTextPrimary)
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -244,6 +269,30 @@ fun DriverMenuScreen(
                             }
                         }
                         Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, contentDescription = null, tint = AnyRollerTextMuted)
+                    }
+
+                    // Live "This Shift" Summary Strip
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(AnyRollerBgPrimary)
+                            .padding(horizontal = 12.dp, vertical = 10.dp)
+                            .testTag("menu_shift_summary_strip"),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        ShiftStatCell(label = "This Shift", value = shiftDurationText, color = AnyRollerTextPrimary)
+                        ShiftStatCell(label = "Trips", value = "${state.shiftTripsCompleted}", color = AnyRollerBlue)
+                        ShiftStatCell(
+                            label = "Live Rate",
+                            value = "£%.0f/hr".format(state.shiftHourlyRate),
+                            color = AnyRollerGreen
+                        )
+                        ShiftStatCell(
+                            label = "Paid / Empty",
+                            value = "%.1f/%.1fmi".format(state.shiftPaidMiles, state.shiftDeadheadMiles),
+                            color = AnyRollerOrange
+                        )
                     }
 
                     // Daily Driving Hours Safety Bar (synced to Admin maxDailyDriverHours)
@@ -279,14 +328,44 @@ fun DriverMenuScreen(
                 }
             }
 
-            // Admin Taxi Portal Soft-Launch / Coming Soon Notice (if enabled in Admin Global Controls)
+            // Conditional Priority Action Banners (housed inside Menu, never cluttering active map)
+            if (state.fatigueReminderActive && state.isOnline && !state.isOnBreak) {
+                Surface(
+                    color = AnyRollerOrange.copy(alpha = 0.14f),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, AnyRollerOrange.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                            Icon(Icons.Rounded.LocalCafe, contentDescription = null, tint = AnyRollerOrange)
+                            Spacer(Modifier.width(10.dp))
+                            Column {
+                                Text("Fatigue Break Reminder", style = MaterialTheme.typography.labelLarge, color = AnyRollerOrange)
+                                Text(
+                                    "You've been driving ${cockpit.fatigueReminderHours}h+ continuously. Take a quick 15m coffee break?",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = AnyRollerTextSecondary
+                                )
+                            }
+                        }
+                        TextButton(onClick = { viewModel.startBreak(15) }) {
+                            Text("15m Break", color = AnyRollerOrange, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+
             if (state.globalPlatformStatus.taxiComingSoon) {
                 Surface(
                     color = AnyRollerBlue.copy(alpha = 0.14f),
                     shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .border(1.dp, AnyRollerBlue.copy(alpha = 0.45f), RoundedCornerShape(16.dp))
+                    modifier = Modifier.fillMaxWidth().border(1.dp, AnyRollerBlue.copy(alpha = 0.45f), RoundedCornerShape(16.dp))
                 ) {
                     Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Rounded.Info, contentDescription = null, tint = AnyRollerBlue)
@@ -308,7 +387,6 @@ fun DriverMenuScreen(
                 }
             }
 
-            // Actionable Menu Banners (all housed cleanly inside Menu, never cluttering the Map)
             if (state.needsStripeSetup) {
                 Surface(
                     onClick = { viewModel.launchStripeConnectOnboarding() },
@@ -395,15 +473,12 @@ fun DriverMenuScreen(
                 }
             }
 
-            // Battery Optimisation Warning Banner (for reliable background offers)
             if (batteryOptimized) {
                 Surface(
                     onClick = { ExternalIntentHelpers.openBatteryOptimizationSettings(context) },
                     color = AnyRollerOrange.copy(alpha = 0.14f),
                     shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .border(1.dp, AnyRollerOrange.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+                    modifier = Modifier.fillMaxWidth().border(1.dp, AnyRollerOrange.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
                 ) {
                     Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Rounded.BatteryAlert, contentDescription = null, tint = AnyRollerOrange)
@@ -416,7 +491,500 @@ fun DriverMenuScreen(
                 }
             }
 
-            // Driver Operations Sub-Screens
+            // =====================================================================
+            // SECTION 1 — SHIFT & DISPATCH CONTROLS (Always expanded)
+            // =====================================================================
+            SectionGroupLabel("1. SHIFT & DISPATCH CONTROLS")
+            Surface(
+                color = AnyRollerBgSecondary,
+                shape = RoundedCornerShape(20.dp),
+                modifier = Modifier.fillMaxWidth().border(1.dp, AnyRollerBorder, RoundedCornerShape(20.dp))
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    // Coffee Break / Pause New Requests
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.LocalCafe, contentDescription = null, tint = AnyRollerOrange, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Coffee Break (Pause New Requests)", style = MaterialTheme.typography.bodyMedium, color = AnyRollerTextPrimary, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    text = if (state.isOnBreak) {
+                                        if (state.breakIsOpenEnded) "Requests paused (Open break)"
+                                        else "Paused • %02d:%02d remaining".format(state.breakSecondsLeft / 60, state.breakSecondsLeft % 60)
+                                    } else "Take a breather without losing your shift streak",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (state.isOnBreak) AnyRollerOrange else AnyRollerTextMuted
+                                )
+                            }
+                        }
+                        if (state.isOnBreak) {
+                            Button(
+                                onClick = { viewModel.endBreak() },
+                                colors = ButtonDefaults.buttonColors(containerColor = AnyRollerOrange, contentColor = AnyRollerBgPrimary),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.fillMaxWidth().height(48.dp).testTag("menu_resume_break_button")
+                            ) {
+                                Text("Resume Receiving Ride Requests", fontWeight = FontWeight.Bold)
+                            }
+                        } else {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                                listOf(15 to "15m", 30 to "30m", null to "Open").forEach { (mins, label) ->
+                                    OutlinedButton(
+                                        onClick = { viewModel.startBreak(mins) },
+                                        enabled = state.isOnline && state.activeRide == null,
+                                        shape = RoundedCornerShape(10.dp),
+                                        modifier = Modifier.weight(1f).height(44.dp).testTag("menu_break_${mins ?: "open"}")
+                                    ) {
+                                        Text(label, color = if (state.isOnline) AnyRollerOrange else AnyRollerTextMuted, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(color = AnyRollerBorder)
+
+                    MenuSwitchRow(
+                        title = "Stack Next Ride",
+                        subtitle = "Receive queued offers while finishing current trip",
+                        checked = profile.stackingEnabled,
+                        testTag = "switch_stacking",
+                        onCheckedChange = { enabled ->
+                            pendingToggleConfirm = Triple(
+                                if (enabled) "Enable Stack Next Ride?" else "Disable Stack Next Ride?",
+                                if (enabled) "You will receive queued next-ride offers while approaching your current drop-off."
+                                else "You will not receive queued offers until your current trip is finished.",
+                                { viewModel.updateUserPref("isStackingEnabled", enabled) }
+                            )
+                        }
+                    )
+                    MenuSwitchRow(
+                        title = "Last Job Mode",
+                        subtitle = "Go Offline automatically after completing current ride",
+                        checked = profile.lastJob,
+                        testTag = "switch_last_job",
+                        onCheckedChange = { enabled ->
+                            if (enabled) {
+                                pendingToggleConfirm = Triple(
+                                    "Enable Last Job Mode?",
+                                    "You will be switched Offline automatically once your current trip finishes.",
+                                    { viewModel.updateUserPref("isLastJob", true) }
+                                )
+                            } else {
+                                viewModel.updateUserPref("isLastJob", false)
+                            }
+                        }
+                    )
+                    MenuSwitchRow(
+                        title = "Destination Mode",
+                        subtitle = profile.homeAddress?.takeIf { it.isNotBlank() } ?: "Head toward home address",
+                        checked = profile.destinationModeActive,
+                        testTag = "switch_destination_mode",
+                        onCheckedChange = { enabled ->
+                            pendingToggleConfirm = Triple(
+                                if (enabled) "Enable Destination Mode?" else "Disable Destination Mode?",
+                                if (enabled) "Dispatch will prioritise trips heading toward your saved Home destination."
+                                else "You will resume receiving ride offers in all directions.",
+                                { viewModel.updateUserPref("destinationModeActive", enabled) }
+                            )
+                        }
+                    )
+                    OutlinedButton(
+                        onClick = { showHomeModal = true },
+                        modifier = Modifier.fillMaxWidth().height(48.dp).testTag("edit_home_address_button")
+                    ) {
+                        Icon(Icons.Rounded.Home, contentDescription = null, modifier = Modifier.size(16.dp), tint = AnyRollerGreen)
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            profile.homeAddress?.takeIf { it.isNotBlank() } ?: "Set Home UK Postcode / Address",
+                            color = AnyRollerTextPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    HorizontalDivider(color = AnyRollerBorder)
+
+                    // Auto-Accept Mode (OFF by default, with safety confirmation & min fare / max pickup rules)
+                    MenuSwitchRow(
+                        title = "Auto-Accept Matching Rides",
+                        subtitle = if (cockpit.autoAcceptEnabled) {
+                            "Active: Min £%.0f • Max %.0f mi pickup".format(cockpit.autoAcceptMinFare, cockpit.autoAcceptMaxPickupMiles)
+                        } else "Off by default — automatically accept offers matching your rules",
+                        checked = cockpit.autoAcceptEnabled,
+                        testTag = "switch_auto_accept",
+                        onCheckedChange = { enabled ->
+                            if (enabled) {
+                                pendingToggleConfirm = Triple(
+                                    "Enable Auto-Accept Mode?",
+                                    "Incoming offers that meet your minimum fare and pickup distance will be accepted automatically while you are Online.",
+                                    { viewModel.updateCockpitSettings { it.copy(autoAcceptEnabled = true) } }
+                                )
+                            } else {
+                                viewModel.updateCockpitSettings { it.copy(autoAcceptEnabled = false) }
+                            }
+                        }
+                    )
+                    AnimatedVisibility(visible = cockpit.autoAcceptEnabled) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("Minimum Fare (£)", style = MaterialTheme.typography.labelSmall, color = AnyRollerTextMuted)
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                                listOf(6.0, 8.0, 12.0, 15.0, 20.0).forEach { minFare ->
+                                    val sel = cockpit.autoAcceptMinFare == minFare
+                                    ChipOption(
+                                        label = "£${minFare.toInt()}",
+                                        selected = sel,
+                                        testTag = "auto_accept_fare_${minFare.toInt()}",
+                                        onClick = { viewModel.updateCockpitSettings { it.copy(autoAcceptMinFare = minFare) } },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+                            Text("Max Pickup Distance", style = MaterialTheme.typography.labelSmall, color = AnyRollerTextMuted)
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                                listOf(1.5, 3.0, 5.0, 8.0).forEach { maxMi ->
+                                    val sel = cockpit.autoAcceptMaxPickupMiles == maxMi
+                                    ChipOption(
+                                        label = "${maxMi}mi",
+                                        selected = sel,
+                                        testTag = "auto_accept_dist_${maxMi}",
+                                        onClick = { viewModel.updateCockpitSettings { it.copy(autoAcceptMaxPickupMiles = maxMi) } },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // =====================================================================
+            // SECTION 2 — NAVIGATION & COCKPIT DISPLAY
+            // =====================================================================
+            SectionGroupLabel("2. NAVIGATION & COCKPIT DISPLAY")
+            CollapsibleSettingsCard(
+                icon = Icons.Rounded.Navigation,
+                iconTint = AnyRollerBlue,
+                title = "Navigation & Cockpit Display",
+                subtitle = "${profile.defaultNavApp} • Auto-Launch ${if (cockpit.autoLaunchExternalNav) "ON" else "OFF"} • Map ${cockpit.mapThemeMode.replaceFirstChar { it.uppercase() }}",
+                expanded = expandNavCockpit,
+                testTag = "section_nav_cockpit_header",
+                onToggle = { expandNavCockpit = !expandNavCockpit }
+            ) {
+                // Auto-Launch External Navigation (ON by default, toggleable OFF)
+                MenuSwitchRow(
+                    title = "Auto-Launch External Navigation",
+                    subtitle = "Automatically open ${profile.defaultNavApp} on Accept Ride & Start Trip (saves 2 taps)",
+                    checked = cockpit.autoLaunchExternalNav,
+                    testTag = "switch_auto_launch_external_nav",
+                    onCheckedChange = { enabled ->
+                        viewModel.updateCockpitSettings { it.copy(autoLaunchExternalNav = enabled) }
+                    }
+                )
+
+                // Default Navigation App Segmented Selector
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Default Navigation App", style = MaterialTheme.typography.labelSmall, color = AnyRollerTextMuted)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        listOf("Google Maps", "Waze").forEach { app ->
+                            val sel = profile.defaultNavApp.equals(app, ignoreCase = true)
+                            ChipOption(
+                                label = app,
+                                selected = sel,
+                                testTag = "nav_app_${app.lowercase().replace(" ", "_")}",
+                                onClick = { viewModel.updateUserPref("defaultNavApp", app) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
+
+                // Auto-Night / High-Contrast Map Theme
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Map Theme (High-Contrast Day / Night)", style = MaterialTheme.typography.labelSmall, color = AnyRollerTextMuted)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        listOf("auto" to "Auto", "dark" to "Dark", "light" to "Daylight").forEach { (key, label) ->
+                            ChipOption(
+                                label = label,
+                                selected = cockpit.mapThemeMode.equals(key, ignoreCase = true),
+                                testTag = "map_theme_$key",
+                                onClick = { viewModel.updateCockpitSettings { it.copy(mapThemeMode = key) } },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = AnyRollerBorder)
+
+                MenuSwitchRow(
+                    title = "Picture-in-Picture Mini Window",
+                    subtitle = "Keep live trip status & speed visible while using Google Maps or Waze",
+                    checked = cockpit.pipEnabled,
+                    testTag = "switch_pip_enabled",
+                    onCheckedChange = { enabled ->
+                        viewModel.updateCockpitSettings { it.copy(pipEnabled = enabled) }
+                    }
+                )
+                MenuSwitchRow(
+                    title = "Keep Screen Awake While Online",
+                    subtitle = "Prevent screen sleep during shifts and active rides",
+                    checked = cockpit.keepScreenAwake,
+                    testTag = "switch_keep_screen_awake",
+                    onCheckedChange = { enabled ->
+                        viewModel.updateCockpitSettings { it.copy(keepScreenAwake = enabled) }
+                    }
+                )
+                MenuSwitchRow(
+                    title = "Auto-Brightness Boost",
+                    subtitle = "Boost cockpit screen brightness (85%) in bright UK daylight",
+                    checked = cockpit.autoBrightnessBoost,
+                    testTag = "switch_auto_brightness_boost",
+                    onCheckedChange = { enabled ->
+                        viewModel.updateCockpitSettings { it.copy(autoBrightnessBoost = enabled) }
+                    }
+                )
+            }
+
+            // =====================================================================
+            // SECTION 3 — SAFETY, AUDIO & ALERTS
+            // =====================================================================
+            SectionGroupLabel("3. SAFETY, AUDIO & ALERTS")
+            CollapsibleSettingsCard(
+                icon = Icons.Rounded.Shield,
+                iconTint = AnyRollerOrange,
+                title = "Safety, Audio & Alerts",
+                subtitle = "Speed alert ${if (cockpit.speedAlertMph == 0) "Off" else "${cockpit.speedAlertMph} mph"} • Fatigue ${if (cockpit.fatigueReminderHours == 0) "Off" else "${cockpit.fatigueReminderHours}h"}",
+                expanded = expandSafetyAudio,
+                testTag = "section_safety_audio_header",
+                onToggle = { expandSafetyAudio = !expandSafetyAudio }
+            ) {
+                MenuSwitchRow(
+                    title = "Require 4-Digit Passcode (PIN)",
+                    subtitle = "Verify passenger PIN before starting every trip",
+                    checked = profile.requirePasscode,
+                    testTag = "switch_passcode",
+                    onCheckedChange = { enabled ->
+                        pendingToggleConfirm = Triple(
+                            if (enabled) "Require 4-Digit Passcode?" else "Disable Passcode Requirement?",
+                            if (enabled) "Passengers must read you their 4-digit PIN before you can start any trip."
+                            else "Trips will start without asking for a 4-digit passenger PIN.",
+                            { viewModel.updateUserPref("requirePasscode", enabled) }
+                        )
+                    }
+                )
+
+                // Over-Speed Alert Threshold
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Over-Speed Gentle Voice & Haptic Alert", style = MaterialTheme.typography.labelSmall, color = AnyRollerTextMuted)
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        listOf(0, 30, 40, 50, 60, 70).forEach { mph ->
+                            ChipOption(
+                                label = if (mph == 0) "Off" else "$mph mph",
+                                selected = cockpit.speedAlertMph == mph,
+                                testTag = "speed_alert_$mph",
+                                onClick = { viewModel.updateCockpitSettings { it.copy(speedAlertMph = mph) } }
+                            )
+                        }
+                    }
+                }
+
+                // Smart Fatigue Break Reminder
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Smart Fatigue Break Reminder", style = MaterialTheme.typography.labelSmall, color = AnyRollerTextMuted)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                        listOf(0, 2, 3, 4, 5).forEach { hrs ->
+                            ChipOption(
+                                label = if (hrs == 0) "Off" else "${hrs}h",
+                                selected = cockpit.fatigueReminderHours == hrs,
+                                testTag = "fatigue_hours_$hrs",
+                                onClick = { viewModel.updateCockpitSettings { it.copy(fatigueReminderHours = hrs) } },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
+
+                // Emergency Contact for 1-Tap Safety Toolkit Live Share
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Trusted Emergency Contact (Safety Share)", style = MaterialTheme.typography.labelSmall, color = AnyRollerTextMuted)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = emergencyPhoneDraft,
+                            onValueChange = { emergencyPhoneDraft = it },
+                            placeholder = { Text("+44 7700 900000", color = AnyRollerTextMuted) },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = AnyRollerGreen,
+                                unfocusedBorderColor = AnyRollerBorder,
+                                focusedContainerColor = AnyRollerBgInput,
+                                unfocusedContainerColor = AnyRollerBgInput,
+                                focusedTextColor = AnyRollerTextPrimary,
+                                unfocusedTextColor = AnyRollerTextPrimary
+                            ),
+                            modifier = Modifier.weight(1f).testTag("emergency_contact_input")
+                        )
+                        Button(
+                            onClick = {
+                                viewModel.updateCockpitSettings { it.copy(emergencyContactPhone = emergencyPhoneDraft.trim()) }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = AnyRollerBlue, contentColor = Color.White),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.height(52.dp).testTag("save_emergency_contact_button")
+                        ) {
+                            Text("Save", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = AnyRollerBorder)
+
+                MenuSwitchRow(
+                    title = "Mute Ride Offer Alerts",
+                    subtitle = "Silence chime for incoming ride offers",
+                    checked = profile.muteRideOfferAlerts,
+                    testTag = "switch_mute_offers",
+                    onCheckedChange = { enabled ->
+                        pendingToggleConfirm = Triple(
+                            if (enabled) "Mute Ride Offer Alerts?" else "Unmute Ride Offer Alerts?",
+                            if (enabled) "Incoming ride offer chimes will be silenced. You may miss offers if not watching the screen."
+                            else "Incoming ride offer chimes will play normally.",
+                            { viewModel.updateUserPref("muteRideOfferAlerts", enabled) }
+                        )
+                    }
+                )
+                MenuSwitchRow(
+                    title = "Mute Heads-Up Voice & Chat Read-Aloud",
+                    subtitle = "Silence spoken navigation callouts and hands-free passenger messages",
+                    checked = profile.muteHeadsUpVolume,
+                    testTag = "switch_mute_headsup",
+                    onCheckedChange = { enabled ->
+                        pendingToggleConfirm = Triple(
+                            if (enabled) "Mute Heads-Up Voice?" else "Unmute Heads-Up Voice?",
+                            if (enabled) "Spoken turn-by-turn directions and hands-free chat read-aloud will be muted."
+                            else "Spoken navigation directions and incoming passenger messages will be read aloud.",
+                            { viewModel.updateUserPref("muteHeadsUpVolume", enabled) }
+                        )
+                    }
+                )
+                MenuSwitchRow(
+                    title = "Scheduled Job Reminder Alarms",
+                    subtitle = "Local alerts 45 min & 15 min before accepted scheduled pickups",
+                    checked = cockpit.scheduledRemindersEnabled,
+                    testTag = "switch_scheduled_reminders",
+                    onCheckedChange = { enabled ->
+                        viewModel.updateCockpitSettings { it.copy(scheduledRemindersEnabled = enabled) }
+                    }
+                )
+            }
+
+            // 4-Tier Cost-Capped Offline & WhatsApp Alerts Card (Exact mirror of OfflineAlertsCard.tsx)
+            OfflineWhatsAppAlertsCard(
+                state = state,
+                viewModel = viewModel,
+                expanded = showWhatsAppCard,
+                onToggleExpanded = { showWhatsAppCard = !showWhatsAppCard }
+            )
+
+            // =====================================================================
+            // SECTION 4 — VEHICLE & SERVICE TIERS
+            // =====================================================================
+            SectionGroupLabel("4. VEHICLE & SERVICE TIERS")
+            CollapsibleSettingsCard(
+                icon = Icons.Rounded.DirectionsCar,
+                iconTint = AnyRollerGreen,
+                title = "Vehicle & Service Tiers",
+                subtitle = "${state.localVehicleCategories.size} tiers active • %.0f%% commission".format(state.activeCommissionRate * 100.0),
+                expanded = expandVehicleTiers,
+                testTag = "section_vehicle_tiers_header",
+                onToggle = { expandVehicleTiers = !expandVehicleTiers }
+            ) {
+                MenuSwitchRow(
+                    title = "Pet-Friendly Vehicle",
+                    subtitle = "Accept riders travelling with pets (live dispatch)",
+                    checked = state.localPetFriendly,
+                    testTag = "switch_pet_friendly",
+                    onCheckedChange = { viewModel.togglePetFriendly(it) }
+                )
+
+                Text("Active Vehicle Tiers (Live Admin Config)", style = MaterialTheme.typography.labelMedium, color = AnyRollerTextMuted)
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    state.platformConfig.vehicleTypes.forEach { tier ->
+                        val active = tier.id in state.localVehicleCategories
+                        Surface(
+                            onClick = { viewModel.toggleVehicleCategory(tier.id) },
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (active) AnyRollerGreen else AnyRollerBgTertiary,
+                            modifier = Modifier.testTag("tier_chip_${tier.id}")
+                        ) {
+                            Text(
+                                text = "${tier.name} (${"%.1fx".format(tier.multiplier)})",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (active) AnyRollerBgPrimary else AnyRollerTextPrimary,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)
+                            )
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = AnyRollerBorder)
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Rounded.Percent, contentDescription = null, tint = AnyRollerGreen, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Platform Commission", style = MaterialTheme.typography.titleSmall, color = AnyRollerTextPrimary)
+                        Text(
+                            text = if (state.platformConfig.fixedTripFee > 0.0) {
+                                "%.0f%% + £%.2f fixed fee (Live Admin rate)".format(
+                                    state.activeCommissionRate * 100.0,
+                                    state.platformConfig.fixedTripFee
+                                )
+                            } else {
+                                "Fixed at %.0f%% (%s tier)".format(
+                                    state.activeCommissionRate * 100.0,
+                                    if (profile.isGoldDriver) "Gold Driver" else "Standard"
+                                )
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = AnyRollerTextMuted
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(AnyRollerGreen.copy(alpha = 0.16f))
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            "%.0f%%".format(state.activeCommissionRate * 100.0),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFont,
+                            fontWeight = FontWeight.Bold,
+                            color = AnyRollerGreen
+                        )
+                    }
+                }
+            }
+
+            // =====================================================================
+            // SECTION 5 — OPERATIONS & BUSINESS
+            // =====================================================================
+            SectionGroupLabel("5. OPERATIONS & BUSINESS")
             Surface(
                 color = AnyRollerBgSecondary,
                 shape = RoundedCornerShape(20.dp),
@@ -459,228 +1027,18 @@ fun DriverMenuScreen(
                     HorizontalDivider(color = AnyRollerBorder)
                     MenuActionRow(
                         icon = Icons.Rounded.ReceiptLong,
-                        title = "Driver Expenses",
-                        subtitle = "${state.expenses.size} receipts logged for tax",
+                        title = "Driver Expenses & Receipt OCR",
+                        subtitle = "${state.expenses.size} receipts logged for HMRC tax",
                         testTag = "menu_expenses_row",
                         onClick = { viewModel.openOverlay(DriverOverlayRoute.EXPENSES) }
                     )
-                    HorizontalDivider(color = AnyRollerBorder)
-                    // Live Admin-Synced Platform Fee Row
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Rounded.Percent, contentDescription = null, tint = AnyRollerGreen, modifier = Modifier.size(22.dp))
-                        Spacer(Modifier.width(12.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Platform Commission", style = MaterialTheme.typography.titleSmall, color = AnyRollerTextPrimary)
-                            Text(
-                                text = if (state.platformConfig.fixedTripFee > 0.0) {
-                                    "%.0f%% + £%.2f fixed fee (Live Admin rate)".format(
-                                        state.activeCommissionRate * 100.0,
-                                        state.platformConfig.fixedTripFee
-                                    )
-                                } else {
-                                    "Fixed at %.0f%% (%s tier)".format(
-                                        state.activeCommissionRate * 100.0,
-                                        if (profile.isGoldDriver) "Gold Driver" else "Standard"
-                                    )
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = AnyRollerTextMuted
-                            )
-                        }
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(AnyRollerGreen.copy(alpha = 0.16f))
-                                .padding(horizontal = 8.dp, vertical = 4.dp)
-                        ) {
-                            Text(
-                                "%.0f%%".format(state.activeCommissionRate * 100.0),
-                                style = MaterialTheme.typography.labelSmall,
-                                fontFamily = JetBrainsMonoFont,
-                                fontWeight = FontWeight.Bold,
-                                color = AnyRollerGreen
-                            )
-                        }
-                    }
                 }
             }
 
-            // Primary Shift Controls (Always visible for fast 1-tap driver workflow)
-            Surface(
-                color = AnyRollerBgSecondary,
-                shape = RoundedCornerShape(20.dp),
-                modifier = Modifier.fillMaxWidth().border(1.dp, AnyRollerBorder, RoundedCornerShape(20.dp))
-            ) {
-                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Shift Controls", style = MaterialTheme.typography.titleMedium, color = AnyRollerTextPrimary)
-
-                    MenuSwitchRow(
-                        title = "Stack Next Ride",
-                        subtitle = "Receive queued offers while finishing current trip",
-                        checked = profile.stackingEnabled,
-                        testTag = "switch_stacking",
-                        onCheckedChange = { viewModel.updateUserPref("isStackingEnabled", it) }
-                    )
-                    MenuSwitchRow(
-                        title = "Last Job Mode",
-                        subtitle = "Go Offline automatically after completing current ride",
-                        checked = profile.lastJob,
-                        testTag = "switch_last_job",
-                        onCheckedChange = { enabled ->
-                            if (enabled) {
-                                pendingToggleConfirm = Triple(
-                                    "Enable Last Job Mode?",
-                                    "You will be switched Offline automatically once your current trip finishes.",
-                                    { viewModel.updateUserPref("isLastJob", true) }
-                                )
-                            } else {
-                                viewModel.updateUserPref("isLastJob", false)
-                            }
-                        }
-                    )
-                    MenuSwitchRow(
-                        title = "Destination Mode",
-                        subtitle = profile.homeAddress?.takeIf { it.isNotBlank() } ?: "Head toward home address",
-                        checked = profile.destinationModeActive,
-                        testTag = "switch_destination_mode",
-                        onCheckedChange = { viewModel.updateUserPref("destinationModeActive", it) }
-                    )
-                    OutlinedButton(
-                        onClick = { showHomeModal = true },
-                        modifier = Modifier.fillMaxWidth().testTag("edit_home_address_button")
-                    ) {
-                        Icon(Icons.Rounded.Home, contentDescription = null, modifier = Modifier.size(16.dp), tint = AnyRollerGreen)
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            profile.homeAddress?.takeIf { it.isNotBlank() } ?: "Set Home UK Postcode / Address",
-                            color = AnyRollerTextPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
-            }
-
-            // Collapsible Dispatch, Audio, Safety & Vehicle Tier Preferences
-            Surface(
-                color = AnyRollerBgSecondary,
-                shape = RoundedCornerShape(20.dp),
-                modifier = Modifier.fillMaxWidth().border(1.dp, AnyRollerBorder, RoundedCornerShape(20.dp))
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { showAdvancedPrefs = !showAdvancedPrefs }
-                            .testTag("toggle_advanced_prefs_button"),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Rounded.Tune, contentDescription = null, tint = AnyRollerGreen, modifier = Modifier.size(20.dp))
-                            Spacer(Modifier.width(10.dp))
-                            Column {
-                                Text("Vehicle, Audio & Safety Settings", style = MaterialTheme.typography.titleMedium, color = AnyRollerTextPrimary)
-                                Text(
-                                    "${state.localVehicleCategories.size} tiers active • ${profile.defaultNavApp}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = AnyRollerTextMuted
-                                )
-                            }
-                        }
-                        Icon(
-                            imageVector = if (showAdvancedPrefs) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
-                            contentDescription = "Toggle Advanced Preferences",
-                            tint = AnyRollerTextMuted
-                        )
-                    }
-
-                    AnimatedVisibility(visible = showAdvancedPrefs) {
-                        Column(
-                            modifier = Modifier.padding(top = 14.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            HorizontalDivider(color = AnyRollerBorder)
-                            OutlinedButton(
-                                onClick = { showNavAppModal = true },
-                                modifier = Modifier.fillMaxWidth().testTag("edit_nav_app_button")
-                            ) {
-                                Icon(Icons.Rounded.Navigation, contentDescription = null, modifier = Modifier.size(16.dp), tint = AnyRollerBlue)
-                                Spacer(Modifier.width(6.dp))
-                                Text("Navigation App: ${profile.defaultNavApp}", color = AnyRollerTextPrimary)
-                            }
-                            MenuSwitchRow(
-                                title = "Require 4-Digit Passcode (PIN)",
-                                subtitle = "Verify passenger PIN before starting every trip",
-                                checked = profile.requirePasscode,
-                                testTag = "switch_passcode",
-                                onCheckedChange = { viewModel.updateUserPref("requirePasscode", it) }
-                            )
-                            MenuSwitchRow(
-                                title = "Mute Ride Offer Alerts",
-                                subtitle = "Silence chime for incoming ride offers",
-                                checked = profile.muteRideOfferAlerts,
-                                testTag = "switch_mute_offers",
-                                onCheckedChange = { viewModel.updateUserPref("muteRideOfferAlerts", it) }
-                            )
-                            MenuSwitchRow(
-                                title = "Mute Heads-Up Voice",
-                                subtitle = "Silence spoken navigation callouts",
-                                checked = profile.muteHeadsUpVolume,
-                                testTag = "switch_mute_headsup",
-                                onCheckedChange = { viewModel.updateUserPref("muteHeadsUpVolume", it) }
-                            )
-                            MenuSwitchRow(
-                                title = "Pet-Friendly Vehicle",
-                                subtitle = "Accept riders travelling with pets (live dispatch)",
-                                checked = state.localPetFriendly,
-                                testTag = "switch_pet_friendly",
-                                onCheckedChange = { viewModel.togglePetFriendly(it) }
-                            )
-
-                            Text("Active Vehicle Tiers (Live Admin Config)", style = MaterialTheme.typography.labelMedium, color = AnyRollerTextMuted)
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                state.platformConfig.vehicleTypes.forEach { tier ->
-                                    val active = tier.id in state.localVehicleCategories
-                                    Surface(
-                                        onClick = { viewModel.toggleVehicleCategory(tier.id) },
-                                        shape = RoundedCornerShape(10.dp),
-                                        color = if (active) AnyRollerGreen else AnyRollerBgTertiary,
-                                        modifier = Modifier.testTag("tier_chip_${tier.id}")
-                                    ) {
-                                        Text(
-                                            text = "${tier.name} (${"%.1fx".format(tier.multiplier)})",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = if (active) AnyRollerBgPrimary else AnyRollerTextPrimary,
-                                            fontWeight = FontWeight.Bold,
-                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Collapsible 4-Tier Cost-Capped Offline & WhatsApp Alerts Card (Exact mirror of OfflineAlertsCard.tsx)
-            OfflineWhatsAppAlertsCard(
-                state = state,
-                viewModel = viewModel,
-                expanded = showWhatsAppCard,
-                onToggleExpanded = { showWhatsAppCard = !showWhatsAppCard }
-            )
-
-            // AnyTrader Ecosystem Shortcuts
+            // =====================================================================
+            // SECTION 6 — ANYTRADER ECOSYSTEM & ACCOUNT
+            // =====================================================================
+            SectionGroupLabel("6. ANYTRADER ECOSYSTEM & ACCOUNT")
             Surface(
                 color = AnyRollerBgSecondary,
                 shape = RoundedCornerShape(20.dp),
@@ -710,16 +1068,7 @@ fun DriverMenuScreen(
                         testTag = "menu_help_row",
                         onClick = { ExternalIntentHelpers.openCustomTab(context, "https://www.anytrader.co.uk/help") }
                     )
-                }
-            }
-
-            // Refer a Driver & Sign Out
-            Surface(
-                color = AnyRollerBgSecondary,
-                shape = RoundedCornerShape(20.dp),
-                modifier = Modifier.fillMaxWidth().border(1.dp, AnyRollerBorder, RoundedCornerShape(20.dp))
-            ) {
-                Column {
+                    HorizontalDivider(color = AnyRollerBorder)
                     MenuActionRow(
                         icon = Icons.Rounded.Share,
                         title = "Refer a Driver",
@@ -791,40 +1140,6 @@ fun DriverMenuScreen(
         )
     }
 
-    if (showNavAppModal) {
-        AlertDialog(
-            onDismissRequest = { showNavAppModal = false },
-            containerColor = AnyRollerBgSecondary,
-            title = { Text("Default Navigation App", color = AnyRollerTextPrimary) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Google Maps", "Waze").forEach { app ->
-                        val selected = profile.defaultNavApp.equals(app, ignoreCase = true)
-                        Surface(
-                            onClick = {
-                                viewModel.updateUserPref("defaultNavApp", app)
-                                showNavAppModal = false
-                            },
-                            shape = RoundedCornerShape(12.dp),
-                            color = if (selected) AnyRollerGreen.copy(alpha = 0.2f) else AnyRollerBgTertiary,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text(
-                                text = if (selected) "$app (Selected)" else app,
-                                color = if (selected) AnyRollerGreen else AnyRollerTextPrimary,
-                                modifier = Modifier.padding(14.dp),
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { showNavAppModal = false }) { Text("Close", color = AnyRollerTextMuted) }
-            }
-        )
-    }
-
     pendingToggleConfirm?.let { (title, message, onConfirm) ->
         AlertDialog(
             onDismissRequest = { pendingToggleConfirm = null },
@@ -841,6 +1156,111 @@ fun DriverMenuScreen(
                 TextButton(onClick = { pendingToggleConfirm = null }) { Text("Cancel", color = AnyRollerTextMuted) }
             }
         )
+    }
+}
+
+@Composable
+private fun SectionGroupLabel(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelSmall,
+        color = AnyRollerTextMuted,
+        fontWeight = FontWeight.ExtraBold,
+        modifier = Modifier.padding(start = 4.dp, top = 4.dp)
+    )
+}
+
+@Composable
+private fun ShiftStatCell(label: String, value: String, color: Color) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(label, style = MaterialTheme.typography.labelSmall, color = AnyRollerTextMuted)
+        Text(
+            text = value,
+            style = MaterialTheme.typography.labelMedium,
+            fontFamily = JetBrainsMonoFont,
+            fontWeight = FontWeight.Bold,
+            color = color
+        )
+    }
+}
+
+@Composable
+private fun CollapsibleSettingsCard(
+    icon: ImageVector,
+    iconTint: Color,
+    title: String,
+    subtitle: String,
+    expanded: Boolean,
+    testTag: String,
+    onToggle: () -> Unit,
+    content: @Composable () -> Unit
+) {
+    Surface(
+        color = AnyRollerBgSecondary,
+        shape = RoundedCornerShape(20.dp),
+        modifier = Modifier.fillMaxWidth().border(1.dp, AnyRollerBorder, RoundedCornerShape(20.dp))
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggle)
+                    .testTag(testTag),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    Icon(icon, contentDescription = null, tint = iconTint, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text(title, style = MaterialTheme.typography.titleMedium, color = AnyRollerTextPrimary)
+                        Text(subtitle, style = MaterialTheme.typography.labelSmall, color = AnyRollerTextMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                Icon(
+                    imageVector = if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                    contentDescription = "Toggle $title",
+                    tint = AnyRollerTextMuted
+                )
+            }
+            AnimatedVisibility(visible = expanded) {
+                Column(
+                    modifier = Modifier.padding(top = 14.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    HorizontalDivider(color = AnyRollerBorder)
+                    content()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChipOption(
+    label: String,
+    selected: Boolean,
+    testTag: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(10.dp),
+        color = if (selected) AnyRollerGreen else AnyRollerBgTertiary,
+        modifier = modifier
+            .border(1.dp, if (selected) AnyRollerGreen else AnyRollerBorder, RoundedCornerShape(10.dp))
+            .testTag(testTag)
+    ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (selected) AnyRollerBgPrimary else AnyRollerTextPrimary,
+                fontWeight = if (selected) FontWeight.ExtraBold else FontWeight.Medium,
+                maxLines = 1
+            )
+        }
     }
 }
 

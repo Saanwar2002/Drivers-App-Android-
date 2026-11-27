@@ -1,5 +1,6 @@
 package com.example.service
 
+import android.app.ActivityManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -120,7 +121,9 @@ class AnyRollerMessagingService : FirebaseMessagingService() {
                     expiresAtMs = expiresAt
                 )
                 UrgentPushEventBus.emit(UrgentPushEvent.RideOffer(offer))
-                showUrgentOfferNotification(offer)
+                if (!isAppInForeground()) {
+                    showUrgentOfferNotification(offer)
+                }
             }
 
             "ride_cancelled", "ride_expired" -> {
@@ -153,6 +156,16 @@ class AnyRollerMessagingService : FirebaseMessagingService() {
         }
     }
 
+    private fun isAppInForeground(): Boolean {
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return false
+        val appProcesses = am.runningAppProcesses ?: return false
+        val pkg = packageName
+        return appProcesses.any { proc ->
+            proc.processName == pkg &&
+                proc.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+        }
+    }
+
     private fun showUrgentOfferNotification(offer: IncomingOfferPush) {
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -165,15 +178,18 @@ class AnyRollerMessagingService : FirebaseMessagingService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val fareLabel = "£%.2f".format(offer.fareEstimate)
+        val routeSummary = "${offer.pickupAddress} → ${offer.dropoffAddress}"
         val notification = NotificationCompat.Builder(this, CHANNEL_RIDE_OFFERS)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle("New Ride Offer • $fareLabel")
-            .setContentText("${offer.pickupAddress} → ${offer.dropoffAddress}")
-            .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setContentText(routeSummary)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(routeSummary))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
             .setAutoCancel(true)
             .setTimeoutAfter(15_000L)
-            .setFullScreenIntent(pi, true)
             .setContentIntent(pi)
             .build()
 

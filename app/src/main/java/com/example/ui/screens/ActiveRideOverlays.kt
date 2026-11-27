@@ -3,8 +3,13 @@ package com.example.ui.screens
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -22,6 +27,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -39,8 +45,13 @@ import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CreditCard
+import androidx.compose.material.icons.rounded.Explore
 import androidx.compose.material.icons.rounded.Flag
+import androidx.compose.material.icons.rounded.Flight
+import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.PauseCircle
 import androidx.compose.material.icons.rounded.Payments
@@ -50,6 +61,8 @@ import androidx.compose.material.icons.rounded.Report
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.StarOutline
 import androidx.compose.material.icons.rounded.Timer
+import androidx.compose.material.icons.rounded.Train
+import androidx.compose.material.icons.rounded.TrendingUp
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.material3.AlertDialog
@@ -60,6 +73,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -70,6 +84,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -88,12 +103,15 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import com.example.data.model.ChatMessage
 import com.example.data.model.FallbackFareConfig
 import com.example.data.model.RideRequest
 import com.example.data.model.RideStop
 import com.example.data.model.resolveRideFinancialSummary
 import com.example.service.ExternalIntentHelpers
+import com.example.service.OfferIntelligenceHelper
 import com.example.service.QrCodeGenerator
+import com.example.ui.components.SwipeConfirmButton
 import com.example.ui.theme.AnyRollerBgInput
 import com.example.ui.theme.AnyRollerBgPrimary
 import com.example.ui.theme.AnyRollerBgSecondary
@@ -112,6 +130,7 @@ import com.example.ui.theme.JetBrainsMonoFont
 import com.example.viewmodel.DriverTerminalUiState
 import com.example.viewmodel.DriverTerminalViewModel
 import com.example.viewmodel.TerminalRideState
+import kotlinx.coroutines.delay
 
 /**
  * Exact 1:1 mirror of Incoming Ride Offer Overlay (Screen 3):
@@ -123,10 +142,26 @@ fun IncomingRideOfferOverlay(
     secondsLeft: Int,
     totalSeconds: Int = 15,
     isBusy: Boolean,
+    driverLat: Double = 0.0,
+    driverLng: Double = 0.0,
+    hasRealDriverFix: Boolean = false,
+    homeLat: Double? = null,
+    homeLng: Double? = null,
     onAccept: () -> Unit,
     onDecline: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val intel = remember(offer.id, driverLat, driverLng, hasRealDriverFix, homeLat, homeLng) {
+        OfferIntelligenceHelper.analyze(
+            offer = offer,
+            driverLat = driverLat,
+            driverLng = driverLng,
+            hasRealDriverFix = hasRealDriverFix,
+            homeLat = homeLat,
+            homeLng = homeLng
+        )
+    }
+
     Surface(
         color = AnyRollerBgSecondary,
         shape = RoundedCornerShape(24.dp),
@@ -141,7 +176,11 @@ fun IncomingRideOfferOverlay(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState())
+                ) {
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(10.dp))
@@ -176,7 +215,32 @@ fun IncomingRideOfferOverlay(
                             )
                         }
                     }
+                    intel.smartTag?.let { tag ->
+                        val (tagColor, tagIcon) = when (tag) {
+                            "AIRPORT" -> AnyRollerBlue to Icons.Rounded.Flight
+                            "RAIL STATION" -> AnyRollerPurple to Icons.Rounded.Train
+                            else -> AnyRollerOrange to Icons.Rounded.TrendingUp
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(tagColor.copy(alpha = 0.2f))
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                                .testTag("offer_smart_tag")
+                        ) {
+                            Icon(tagIcon, contentDescription = null, tint = tagColor, modifier = Modifier.size(12.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                text = tag,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = tagColor,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        }
+                    }
                 }
+                Spacer(Modifier.width(6.dp))
                 Text(
                     text = offer.paymentMethod.uppercase(),
                     style = MaterialTheme.typography.labelSmall,
@@ -260,24 +324,105 @@ fun IncomingRideOfferOverlay(
 
             Spacer(Modifier.height(14.dp))
 
-            // Fare Section below rider profile
-            Row(
+            // Fare + Live Profitability & Direction-of-Travel Intelligence
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(14.dp))
                     .background(AnyRollerBgPrimary)
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Text("Estimated Fare", style = MaterialTheme.typography.bodySmall, color = AnyRollerTextMuted)
-                Text(
-                    text = "£%.2f".format(offer.fareEstimate),
-                    style = MaterialTheme.typography.headlineSmall,
-                    fontFamily = JetBrainsMonoFont,
-                    color = AnyRollerGreen,
-                    fontWeight = FontWeight.ExtraBold
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text("Estimated Fare", style = MaterialTheme.typography.bodySmall, color = AnyRollerTextMuted)
+                        if (intel.estimatedGbpPerHour > 0.0) {
+                            Text(
+                                text = "Est. £%.0f/hr • £%.2f/mi".format(
+                                    intel.estimatedGbpPerHour,
+                                    intel.estimatedGbpPerMile
+                                ),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = JetBrainsMonoFont,
+                                color = AnyRollerGreen,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.testTag("offer_profitability_label")
+                            )
+                        }
+                    }
+                    Text(
+                        text = "£%.2f".format(offer.fareEstimate),
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontFamily = JetBrainsMonoFont,
+                        color = AnyRollerGreen,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+
+                // Direction-of-Travel Compass Pill & Pickup Distance
+                if (intel.compassShort.isNotBlank() || intel.pickupDeadheadMiles > 0.05) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (intel.isHeadingTowardHome) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(AnyRollerGreen.copy(alpha = 0.16f))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    .testTag("offer_toward_home_pill")
+                            ) {
+                                Icon(Icons.Rounded.Home, contentDescription = null, tint = AnyRollerGreen, modifier = Modifier.size(13.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    text = "Toward Home (${intel.compassShort})",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = AnyRollerGreen,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        } else if (intel.compassShort.isNotBlank()) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(AnyRollerBlue.copy(alpha = 0.16f))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    .testTag("offer_compass_pill")
+                            ) {
+                                Icon(Icons.Rounded.Explore, contentDescription = null, tint = AnyRollerBlue, modifier = Modifier.size(13.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    text = "Heading ${intel.compassShort} • %.1f mi".format(intel.totalTripMiles),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = AnyRollerBlue,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                        if (intel.pickupDeadheadMiles > 0.05) {
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(AnyRollerBgSecondary)
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Text(
+                                    text = "Pickup %.1f mi away".format(intel.pickupDeadheadMiles),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = AnyRollerTextSecondary
+                                )
+                            }
+                        }
+                    }
+                }
             }
 
             Spacer(Modifier.height(14.dp))
@@ -291,22 +436,50 @@ fun IncomingRideOfferOverlay(
 
             Spacer(Modifier.height(16.dp))
 
-            // Accept / Decline buttons
+            // Accept / 2-Tap Confirm Decline buttons (mirrors DriverTerminal.tsx declineConfirmActive)
+            var confirmDecline by remember(offer.id) { mutableStateOf(false) }
+            LaunchedEffect(confirmDecline, offer.id) {
+                if (confirmDecline) {
+                    delay(4_000L)
+                    confirmDecline = false
+                }
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                OutlinedButton(
-                    onClick = onDecline,
-                    enabled = !isBusy,
-                    shape = RoundedCornerShape(14.dp),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, AnyRollerBorder),
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(52.dp)
-                        .testTag("decline_offer_button")
-                ) {
-                    Text("Decline", color = AnyRollerTextPrimary, fontWeight = FontWeight.SemiBold)
+                if (confirmDecline) {
+                    Button(
+                        onClick = {
+                            confirmDecline = false
+                            onDecline()
+                        },
+                        enabled = !isBusy,
+                        colors = ButtonDefaults.buttonColors(containerColor = AnyRollerRed, contentColor = Color.White),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(52.dp)
+                            .testTag("confirm_decline_offer_button")
+                    ) {
+                        Text("CONFIRM", fontWeight = FontWeight.ExtraBold)
+                    }
+                } else {
+                    OutlinedButton(
+                        onClick = { confirmDecline = true },
+                        enabled = !isBusy,
+                        shape = RoundedCornerShape(14.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, AnyRollerBorder),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(52.dp)
+                            .testTag("decline_offer_button")
+                    ) {
+                        Text("Decline", color = AnyRollerTextPrimary, fontWeight = FontWeight.SemiBold)
+                    }
                 }
                 Button(
-                    onClick = onAccept,
+                    onClick = {
+                        confirmDecline = false
+                        onAccept()
+                    },
                     enabled = !isBusy,
                     colors = ButtonDefaults.buttonColors(containerColor = AnyRollerGreen, contentColor = AnyRollerBgPrimary),
                     shape = RoundedCornerShape(14.dp),
@@ -327,10 +500,33 @@ fun StackedRideOfferBanner(
     offer: RideRequest,
     secondsLeft: Int,
     isBusy: Boolean,
+    driverLat: Double = 0.0,
+    driverLng: Double = 0.0,
+    hasRealDriverFix: Boolean = false,
+    homeLat: Double? = null,
+    homeLng: Double? = null,
     onAccept: () -> Unit,
     onDecline: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val intel = remember(offer.id, driverLat, driverLng, hasRealDriverFix, homeLat, homeLng) {
+        OfferIntelligenceHelper.analyze(
+            offer = offer,
+            driverLat = driverLat,
+            driverLng = driverLng,
+            hasRealDriverFix = hasRealDriverFix,
+            homeLat = homeLat,
+            homeLng = homeLng
+        )
+    }
+    var confirmDecline by remember(offer.id) { mutableStateOf(false) }
+    LaunchedEffect(confirmDecline, offer.id) {
+        if (confirmDecline) {
+            delay(4_000L)
+            confirmDecline = false
+        }
+    }
+
     Surface(
         color = AnyRollerBgSecondary,
         shape = RoundedCornerShape(20.dp),
@@ -352,6 +548,20 @@ fun StackedRideOfferBanner(
                 )
                 Text("${secondsLeft}s", style = MaterialTheme.typography.labelMedium, color = AnyRollerOrange)
             }
+            val metaLine = buildList {
+                if (intel.estimatedGbpPerHour > 0.0) add("£%.0f/hr".format(intel.estimatedGbpPerHour))
+                if (intel.isHeadingTowardHome) add("Toward Home")
+                else if (intel.compassShort.isNotBlank()) add("Heading ${intel.compassShort}")
+                intel.smartTag?.let { add(it) }
+            }.joinToString(" • ")
+            if (metaLine.isNotBlank()) {
+                Text(
+                    text = metaLine,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = AnyRollerGreen,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
             Spacer(Modifier.height(4.dp))
             Text(
                 text = "${offer.pickupAddress} → ${offer.dropoffAddress}",
@@ -362,18 +572,35 @@ fun StackedRideOfferBanner(
             )
             Spacer(Modifier.height(10.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = onDecline,
-                    enabled = !isBusy,
-                    modifier = Modifier.weight(1f).height(44.dp).testTag("decline_stacked_button")
-                ) {
-                    Text("Skip", color = AnyRollerTextMuted)
+                if (confirmDecline) {
+                    Button(
+                        onClick = {
+                            confirmDecline = false
+                            onDecline()
+                        },
+                        enabled = !isBusy,
+                        colors = ButtonDefaults.buttonColors(containerColor = AnyRollerRed, contentColor = Color.White),
+                        modifier = Modifier.weight(1f).height(48.dp).testTag("confirm_decline_stacked_button")
+                    ) {
+                        Text("CONFIRM", fontWeight = FontWeight.ExtraBold)
+                    }
+                } else {
+                    OutlinedButton(
+                        onClick = { confirmDecline = true },
+                        enabled = !isBusy,
+                        modifier = Modifier.weight(1f).height(48.dp).testTag("decline_stacked_button")
+                    ) {
+                        Text("Skip", color = AnyRollerTextMuted)
+                    }
                 }
                 Button(
-                    onClick = onAccept,
+                    onClick = {
+                        confirmDecline = false
+                        onAccept()
+                    },
                     enabled = !isBusy,
                     colors = ButtonDefaults.buttonColors(containerColor = AnyRollerPurple, contentColor = Color.White),
-                    modifier = Modifier.weight(1.6f).height(44.dp).testTag("accept_stacked_button")
+                    modifier = Modifier.weight(1.6f).height(48.dp).testTag("accept_stacked_button")
                 ) {
                     Text("Queue Next Ride", fontWeight = FontWeight.Bold)
                 }
@@ -399,6 +626,14 @@ fun ActiveTripSheetCard(
         ride.currentStopIndex < ride.stops.size
     val liveFare = ride.finalFare?.takeIf { it > 0.0 } ?: ride.fareEstimate
 
+    // Auto-expand card when urgent interactive controls need immediate visibility (PIN, alerts, active wait-at-stop)
+    val forceExpanded = (state.rideState == TerminalRideState.WAITING && requiresPasscode) ||
+        state.showStartTripReminder ||
+        state.showLeaveStopReminder ||
+        !state.lastRideUpdateNotice.isNullOrBlank() ||
+        state.isWaitingAtStop
+    val isCollapsed = state.isActiveCardCollapsed && !forceExpanded
+
     Surface(
         color = AnyRollerBgSecondary,
         shape = RoundedCornerShape(24.dp),
@@ -408,10 +643,46 @@ fun ActiveTripSheetCard(
     ) {
         Column(
             modifier = Modifier
-                .padding(16.dp)
-                .heightIn(max = 460.dp)
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .heightIn(max = 470.dp)
                 .verticalScroll(rememberScrollState())
         ) {
+            // Sleek Drag Handle & Expand/Collapse Pill (mirrors DriverTerminal.tsx isCardCollapsed)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable(enabled = !forceExpanded) { viewModel.toggleActiveCardCollapsed() }
+                    .padding(vertical = 4.dp)
+                    .testTag("active_card_collapse_toggle"),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .width(36.dp)
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(AnyRollerBorder)
+                )
+                if (!forceExpanded) {
+                    Spacer(Modifier.width(8.dp))
+                    Icon(
+                        imageVector = if (isCollapsed) Icons.Rounded.KeyboardArrowUp else Icons.Rounded.KeyboardArrowDown,
+                        contentDescription = if (isCollapsed) "Expand trip details" else "Collapse trip details",
+                        tint = AnyRollerTextMuted,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = if (isCollapsed) "Trip Details" else "Minimize",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = AnyRollerTextMuted
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(6.dp))
+
             // Header row: status + queued chip + passenger name + live fare/tip pill + Chat/Call
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -536,53 +807,116 @@ fun ActiveTripSheetCard(
                 }
             }
 
-            // Mid-trip passenger modification notice (inline inside card — zero map clutter)
-            if (!state.lastRideUpdateNotice.isNullOrBlank()) {
-                Spacer(Modifier.height(8.dp))
+            // Compact single-line summary when collapsed (destination + waiting timer pill)
+            if (isCollapsed) {
+                Spacer(Modifier.height(6.dp))
+                val compactDest = when (state.rideState) {
+                    TerminalRideState.IN_PROGRESS -> {
+                        val nextStop = ride.stops.getOrNull(ride.currentStopIndex)
+                        if (nextStop != null) "Stop ${ride.currentStopIndex + 1}: ${nextStop.address}" else ride.dropoffAddress
+                    }
+                    else -> ride.pickupAddress
+                }
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(AnyRollerOrange.copy(alpha = 0.16f))
-                        .border(1.dp, AnyRollerOrange.copy(alpha = 0.65f), RoundedCornerShape(12.dp))
-                        .padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp)
-                        .testTag("ride_update_notice_banner"),
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        imageVector = Icons.Rounded.NotificationsActive,
-                        contentDescription = null,
-                        tint = AnyRollerOrange,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        text = state.lastRideUpdateNotice,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = AnyRollerTextPrimary,
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.weight(1f)
-                    )
-                    IconButton(
-                        onClick = { viewModel.dismissRideUpdateNotice() },
-                        modifier = Modifier.size(32.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Close,
-                            contentDescription = "Dismiss trip update notice",
-                            tint = AnyRollerOrange,
-                            modifier = Modifier.size(16.dp)
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    when {
+                                        state.rideState != TerminalRideState.IN_PROGRESS -> AnyRollerGreen
+                                        hasRemainingStop -> AnyRollerPurple
+                                        else -> AnyRollerRed
+                                    }
+                                )
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = compactDest,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = AnyRollerTextSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (state.rideState == TerminalRideState.WAITING) {
+                        val freeLeft = (state.platformConfig.freeWaitSeconds - state.waitSecondsElapsed).coerceAtLeast(0)
+                        val paidSecs = (state.waitSecondsElapsed - state.platformConfig.freeWaitSeconds).coerceAtLeast(0)
+                        val displaySecs = if (freeLeft > 0) freeLeft else paidSecs
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = (if (freeLeft > 0) "FREE " else "PAID ") + "%02d:%02d".format(displaySecs / 60, displaySecs % 60),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFont,
+                            color = if (freeLeft > 0) AnyRollerTextPrimary else AnyRollerOrange,
+                            fontWeight = FontWeight.Bold
                         )
                     }
                 }
             }
 
-            Spacer(Modifier.height(10.dp))
-            RouteAddressBlock(
-                pickup = ride.pickupAddress,
-                dropoff = ride.dropoffAddress,
-                stops = ride.stops,
-                currentStopIndex = if (state.rideState == TerminalRideState.IN_PROGRESS) ride.currentStopIndex else -1
-            )
+            // Expandable Detailed Trip Section (Route, Wait Timer, PIN, Wait-at-Stop, Notices)
+            AnimatedVisibility(
+                visible = !isCollapsed,
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut()
+            ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    // Mid-trip passenger modification notice (inline inside card — zero map clutter)
+                    if (!state.lastRideUpdateNotice.isNullOrBlank()) {
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(AnyRollerOrange.copy(alpha = 0.16f))
+                                .border(1.dp, AnyRollerOrange.copy(alpha = 0.65f), RoundedCornerShape(12.dp))
+                                .padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp)
+                                .testTag("ride_update_notice_banner"),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.NotificationsActive,
+                                contentDescription = null,
+                                tint = AnyRollerOrange,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                text = state.lastRideUpdateNotice,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = AnyRollerTextPrimary,
+                                modifier = Modifier.weight(1f)
+                            )
+                            IconButton(
+                                onClick = { viewModel.dismissRideUpdateNotice() },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Close,
+                                    contentDescription = "Dismiss trip update notice",
+                                    tint = AnyRollerOrange,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+                    RouteAddressBlock(
+                        pickup = ride.pickupAddress,
+                        dropoff = ride.dropoffAddress,
+                        stops = ride.stops,
+                        currentStopIndex = if (state.rideState == TerminalRideState.IN_PROGRESS) ride.currentStopIndex else -1
+                    )
 
             // WAITING state: live timer, Forgot-to-Start-Trip reminder, and optional 4-digit PIN
             if (state.rideState == TerminalRideState.WAITING) {
@@ -801,81 +1135,73 @@ fun ActiveTripSheetCard(
                         Icon(Icons.Rounded.Warning, contentDescription = null, tint = AnyRollerPurple, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(8.dp))
                         Text(
-                            text = "Left Stop ${ride.currentStopIndex + 1}? Tap COMPLETE STOP below.",
+                            text = "Left Stop ${ride.currentStopIndex + 1}? Slide GO NEXT below.",
                             style = MaterialTheme.typography.labelSmall,
                             color = AnyRollerTextPrimary
                         )
                     }
                 }
             }
+            } // End of expandable details Column
+            } // End of AnimatedVisibility
 
-            Spacer(Modifier.height(14.dp))
+            Spacer(Modifier.height(12.dp))
 
-            // Primary Ride Action CTA
+            // Primary Ride Action Slide-to-Confirm CTA (mirrors web DriverTerminal.tsx SwipeButton)
             when (state.rideState) {
                 TerminalRideState.EN_ROUTE_PICKUP -> {
-                    Button(
-                        onClick = { viewModel.requestArrivedAtPickup() },
+                    SwipeConfirmButton(
+                        label = "MARK AS ARRIVED",
+                        trackColor = AnyRollerOrange,
+                        contentColor = Color.White,
                         enabled = !state.isBusy,
-                        colors = ButtonDefaults.buttonColors(containerColor = AnyRollerGreen, contentColor = AnyRollerBgPrimary),
-                        shape = RoundedCornerShape(14.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(52.dp)
-                            .testTag("arrived_pickup_button")
-                    ) {
-                        Text("ARRIVED AT PICKUP", fontWeight = FontWeight.ExtraBold)
-                    }
+                        resetKey = "${ride.id}:arrived:${state.showEarlyArrivalDialog}",
+                        testTag = "arrived_pickup_button",
+                        onConfirm = { viewModel.requestArrivedAtPickup() }
+                    )
                 }
                 TerminalRideState.WAITING -> {
-                    Button(
-                        onClick = { viewModel.startTrip(passcodeInput) },
-                        enabled = !state.isBusy,
-                        colors = ButtonDefaults.buttonColors(containerColor = AnyRollerGreen, contentColor = AnyRollerBgPrimary),
-                        shape = RoundedCornerShape(14.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(52.dp)
-                            .testTag("start_trip_button")
-                    ) {
-                        Text("START TRIP", fontWeight = FontWeight.ExtraBold)
-                    }
+                    val pinReady = !requiresPasscode || passcodeInput.length == 4
+                    SwipeConfirmButton(
+                        label = if (pinReady) "START TRIP" else "ENTER 4-DIGIT PIN",
+                        trackColor = AnyRollerGreen,
+                        contentColor = AnyRollerBgPrimary,
+                        enabled = !state.isBusy && pinReady,
+                        resetKey = "${ride.id}:start:$pinReady",
+                        testTag = "start_trip_button",
+                        onConfirm = { viewModel.startTrip(passcodeInput) }
+                    )
                 }
                 TerminalRideState.IN_PROGRESS -> {
                     if (hasRemainingStop) {
-                        Button(
-                            onClick = { viewModel.advanceMultiStop() },
+                        SwipeConfirmButton(
+                            label = "GO NEXT • STOP ${ride.currentStopIndex + 1}",
+                            trackColor = AnyRollerOrange,
+                            contentColor = Color.White,
                             enabled = !state.isBusy,
-                            colors = ButtonDefaults.buttonColors(containerColor = AnyRollerPurple, contentColor = Color.White),
-                            shape = RoundedCornerShape(14.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(52.dp)
-                                .testTag("next_stop_button")
-                        ) {
-                            Text("COMPLETE STOP ${ride.currentStopIndex + 1}", fontWeight = FontWeight.ExtraBold)
-                        }
+                            resetKey = "${ride.id}:stop:${ride.currentStopIndex}",
+                            testTag = "next_stop_button",
+                            onConfirm = { viewModel.advanceMultiStop() }
+                        )
                     } else {
-                        Button(
-                            onClick = { viewModel.requestCompleteTrip() },
+                        SwipeConfirmButton(
+                            label = "COMPLETE",
+                            trackColor = AnyRollerRed,
+                            contentColor = Color.White,
                             enabled = !state.isBusy,
-                            colors = ButtonDefaults.buttonColors(containerColor = AnyRollerGreen, contentColor = AnyRollerBgPrimary),
-                            shape = RoundedCornerShape(14.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(52.dp)
-                                .testTag("complete_trip_button")
-                        ) {
-                            Text("COMPLETE TRIP", fontWeight = FontWeight.ExtraBold)
-                        }
+                            resetKey = "${ride.id}:complete:${state.showCompleteConfirmDialog}",
+                            testTag = "complete_trip_button",
+                            onConfirm = { viewModel.requestCompleteTrip() }
+                        )
                     }
                 }
                 else -> Unit
             }
 
-            if (state.rideState != TerminalRideState.IN_PROGRESS) {
+            // Secondary actions (Cancel / No-Show) shown when expanded
+            AnimatedVisibility(visible = !isCollapsed && state.rideState != TerminalRideState.IN_PROGRESS) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
                     horizontalArrangement = Arrangement.SpaceEvenly
                 ) {
                     TextButton(
@@ -1045,6 +1371,141 @@ fun ActiveTripSheetCard(
                 }
             }
         )
+    }
+}
+
+/**
+ * Floating 10-Second Incoming Chat Quick-Reply Popup Banner (mirrors DriverTerminal.tsx:4794-4848):
+ * Displays just above the active ride sheet when a passenger sends a message while chat is closed,
+ * allowing hands-free 1-tap quick replies or tap-to-open chat without obscuring the road map.
+ */
+@Composable
+fun IncomingChatQuickReplyPopup(
+    passengerName: String,
+    message: ChatMessage,
+    onOpenChat: () -> Unit,
+    onQuickReply: (String) -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val quickReplies = remember {
+        listOf(
+            "OK, got it!",
+            "I'll be right there",
+            "Traffic is heavy",
+            "I'll be outside shortly",
+            "I'm at location but can not find you."
+        )
+    }
+
+    var progress by remember(message.id) { mutableFloatStateOf(1f) }
+    LaunchedEffect(message.id) {
+        val totalSteps = 100
+        for (i in totalSteps downTo 0) {
+            progress = i / totalSteps.toFloat()
+            delay(100L)
+        }
+    }
+
+    Surface(
+        color = AnyRollerBgSecondary.copy(alpha = 0.96f),
+        shape = RoundedCornerShape(20.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .border(1.5.dp, AnyRollerGreen.copy(alpha = 0.75f), RoundedCornerShape(20.dp))
+            .testTag("incoming_chat_popup_banner")
+    ) {
+        Column(modifier = Modifier.padding(start = 14.dp, end = 14.dp, top = 12.dp, bottom = 10.dp)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onOpenChat),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(34.dp)
+                        .clip(CircleShape)
+                        .background(AnyRollerGreen.copy(alpha = 0.2f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = passengerName.firstOrNull()?.uppercase() ?: "P",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = AnyRollerGreen,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Spacer(Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "$passengerName • NEW MESSAGE",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = AnyRollerGreen,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = message.text?.takeIf { it.isNotBlank() } ?: "Sent a photo — tap to view",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = AnyRollerTextPrimary,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("dismiss_chat_popup_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Close,
+                        contentDescription = "Dismiss incoming message popup",
+                        tint = AnyRollerTextMuted,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                quickReplies.forEachIndexed { idx, reply ->
+                    Surface(
+                        onClick = { onQuickReply(reply) },
+                        shape = RoundedCornerShape(14.dp),
+                        color = AnyRollerBgPrimary,
+                        modifier = Modifier
+                            .border(1.dp, AnyRollerGreen.copy(alpha = 0.45f), RoundedCornerShape(14.dp))
+                            .testTag("popup_quick_reply_$idx")
+                    ) {
+                        Text(
+                            text = reply,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = AnyRollerTextPrimary,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+            LinearProgressIndicator(
+                progress = { progress },
+                color = AnyRollerGreen,
+                trackColor = AnyRollerBorder,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(3.dp)
+                    .clip(RoundedCornerShape(2.dp))
+            )
+        }
     }
 }
 
@@ -1529,6 +1990,7 @@ fun RideChatModalSheet(
     var messageText by remember { mutableStateOf("") }
     var showSafetyDialog by remember { mutableStateOf(false) }
     var reportReason by remember { mutableStateOf("") }
+    var activeLightboxImageUrl by remember { mutableStateOf<String?>(null) }
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
@@ -1639,11 +2101,13 @@ fun RideChatModalSheet(
                                 if (!msg.imageUrl.isNullOrBlank()) {
                                     AsyncImage(
                                         model = msg.imageUrl,
-                                        contentDescription = "Chat photo",
+                                        contentDescription = "Chat photo — tap to view fullscreen",
                                         contentScale = ContentScale.Crop,
                                         modifier = Modifier
                                             .size(180.dp)
                                             .clip(RoundedCornerShape(10.dp))
+                                            .clickable { activeLightboxImageUrl = msg.imageUrl }
+                                            .testTag("chat_photo_thumb_${msg.id}")
                                     )
                                     if (!msg.text.isNullOrBlank()) Spacer(Modifier.height(6.dp))
                                 }
@@ -1747,5 +2211,35 @@ fun RideChatModalSheet(
                 TextButton(onClick = { showSafetyDialog = false }) { Text("Cancel", color = AnyRollerTextMuted) }
             }
         )
+    }
+
+    activeLightboxImageUrl?.let { imageUrl ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.94f))
+                .clickable { activeLightboxImageUrl = null }
+                .padding(16.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            AsyncImage(
+                model = imageUrl,
+                contentDescription = "Fullscreen chat photo preview",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize()
+            )
+            IconButton(
+                onClick = { activeLightboxImageUrl = null },
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .statusBarsPadding()
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.65f))
+                    .testTag("close_chat_lightbox_button")
+            ) {
+                Icon(Icons.Rounded.Close, contentDescription = "Close fullscreen photo", tint = Color.White)
+            }
+        }
     }
 }

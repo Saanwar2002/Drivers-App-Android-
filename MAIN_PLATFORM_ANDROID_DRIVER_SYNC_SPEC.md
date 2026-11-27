@@ -20,7 +20,7 @@ However, a full line-by-line audit of the main AnyTrader/AnyRoller backend and `
 - [ ] **P0-4 (`src/components/passenger/PassengerBooking.tsx` + `RideChat.tsx`)**: Fix `assignedDriverInfo?.driverId` → `assignedDriverInfo?.uid` AND attach `Authorization: Bearer <idToken>` headers to all `/api/chat-push` fetch calls (currently failing silently with `401 Unauthorized`).
 - [ ] **P0-5 (`src/components/passenger/PassengerBooking.tsx`)**: Add a handler for `status === "rider_abandoned"` so the passenger UI does not freeze after driver 2-step abandonment.
 - [ ] **P0-6 (`server.ts` background dispatch worker + `driverAuthorization.ts`)**: Send `ride_offers_urgent` FCM pushes when the fairness dispatch loop assigns an offer, use `.set(..., { merge: true })` on `driver_status`, and preserve the active ride's `passengerId` in `live_tracking/{driverId}` when accepting a stacked/queued 2nd ride.
-- [ ] **P1 Enhancements**: Server-side `POST /api/rides/decline`, server-side FCM pushes inside `transition` & `complete`, `live_eta` / `stacked_delay` transition actions, and `POST /api/rides/rate-passenger`.
+- [ ] **P1 Enhancements**: Server-side `POST /api/rides/decline`, server-side FCM pushes inside `transition` & `complete`, `update_eta` (`liveEtaSeconds` / `stackedDriverDelay`) transition action, `POST /api/rides/rate-passenger`, two-way spoken ride chat read-aloud (`P1-6`), and atomic `totalBusinessMileage` increment on ride completion (`P1-7`).
 
 ---
 
@@ -415,6 +415,57 @@ Verify `firestore.rules:503-537` in the main platform repo:
    ```
    Because this branch does not block the existing `driverId` field, the passenger browser can continue calling `setDoc(doc(db, "live_tracking", user.uid), { passengerId: user.uid, lat, lng, updatedAt, isPassenger: true }, { merge: true })` without `permission-denied` even after `executeAcceptRideCommand` stamps `driverId` onto `live_tracking/{passengerId}`.
 
+### P1-6: Two-Way Spoken Ride Chat Read-Aloud & Arrival Outside Sound (`PassengerBooking.tsx`)
+The Android Driver app now reads every incoming passenger message aloud hands-free (respecting the driver's Mute Voice toggle) and plays a confirmation chime + voice alert when pressing **Arrived Outside**.
+
+On the Passenger Web Terminal (`src/components/passenger/PassengerBooking.tsx`):
+1. **Arrived Outside sound + speech (already present at lines 2554-2569):**
+   - Keep `playSound('notification')`, `navigator.vibrate([300, 150, 300, 150, 500])`, and `window.speechSynthesis.speak(new SpeechSynthesisUtterance("Your driver has arrived outside."))` active when `data.status === "arrived"`.
+   - Ensure the `"ride_arrived"` FCM push also plays the system notification sound when the passenger's screen is locked or browser is backgrounded.
+2. **Add Spoken Read-Aloud for Incoming Driver Chat Messages (`PassengerBooking.tsx:1769-1805`):**
+   - Add a small `const [muteVoiceAlerts, setMuteVoiceAlerts] = useState(false);` toggle (e.g., speaker icon in the active ride header / chat drawer) so passengers can mute spoken messages anytime.
+   - Inside the active ride chat `onSnapshot` listener (`collection(db, "ride_requests", currentRideId, "chat")` around line 1777), when a brand-new message arrives from the driver (`latestMsg && latestMsg.id !== lastSpokenChatIdRef.current && latestMsg.senderId !== user.uid`), skip the initial historical batch on mount and speak every new incoming driver message aloud:
+   ```ts
+   const lastSpokenChatIdRef = useRef<string | null>(null);
+   const chatInitializedRef = useRef(false);
+
+   // Inside onSnapshot(q, (snapshot) => { ... }):
+   if (!chatInitializedRef.current) {
+     chatInitializedRef.current = true;
+     lastSpokenChatIdRef.current = latestMsg?.id || null;
+   } else if (latestMsg && latestMsg.id !== lastSpokenChatIdRef.current) {
+     lastSpokenChatIdRef.current = latestMsg.id;
+     if (!muteVoiceAlerts && typeof window !== "undefined" && "speechSynthesis" in window) {
+       try {
+         const driverFirstName = (assignedDriverInfo?.name || "Your driver").split(" ")[0];
+         const cleanText = String(latestMsg.text || "").trim().slice(0, 220);
+         const spoken = latestMsg.imageUrl && cleanText
+           ? `Photo message from ${driverFirstName}: ${cleanText}`
+           : latestMsg.imageUrl
+             ? `${driverFirstName} sent you a photo.`
+             : cleanText
+               ? `Message from ${driverFirstName}: ${cleanText}`
+               : "";
+         if (spoken) {
+           const utterance = new SpeechSynthesisUtterance(spoken);
+           utterance.lang = "en-GB";
+           utterance.rate = 1.0;
+           window.speechSynthesis.speak(utterance);
+         }
+       } catch (e) {
+         console.warn("Passenger chat TTS notice:", e);
+       }
+     }
+   }
+   ```
+   *(Reset `chatInitializedRef.current = false` and `lastSpokenChatIdRef.current = null` whenever `currentRideId` changes.)*
+
+### P1-7: Keep `users/{driverId}.totalBusinessMileage` & Expense CRUD Synced (`rideLifecycleCommands.ts` + `firestore.rules`)
+The Android Driver app now achieves **100% A-to-Z parity** with the web Driver Terminal (`DriverExpenses`, `DriverDocuments`, `DriverEarnings`, `DriverAvailability`, `DriverZones`, `DriverInbox`, `DriverJobs`, `RideChat`, `DriverTerminal`). To keep web and Android tax/mileage dashboards identical:
+1. **HMRC Auto-Tracked Mileage (`rideLifecycleCommands.ts`):** When `executeCompleteRideCommand` finalizes a trip (`auto_card`, `cash_finalize`, or `qr_paid`), atomically increment `users/{driverId}.totalBusinessMileage` by `Number(rideData.distanceMiles || 0)` via `FieldValue.increment(...)` (Android falls back to summing `completedRides.distanceMiles` if `totalBusinessMileage == 0`, so server increment ensures lifetime accuracy beyond query window limits).
+2. **`driver_expenses/{expenseId}` CRUD (`firestore.rules`):** Confirm authenticated drivers can `create`, `update`, and `delete` their own `driver_expenses` docs (`driverId == request.auth.uid`) across all 7 categories (`Fuel`, `Insurance`, `Maintenance`, `Charging`, `Tolls`, `Car Wash`, `Other`) plus `date`, `amount`, `notes`, `receiptImage`, and `updatedAt`.
+3. **Pro Tax / Gold Unlock (`users/{uid}`):** Android checks `proFeaturesEnabled === true || subscriptionType === "driver_gold" || earningsReportExport === true` and invokes `POST /api/create-checkout-session` with `mode: "subscription"` and `metadata: { type: "driver_gold", subscriptionType: "driver_gold", userId }` — matching `DriverExpenses.tsx` verbatim.
+
 ---
 
 ## Verified Android ↔ Main Platform Contract Matrix
@@ -428,12 +479,12 @@ The Android Driver app already implements and expects the following exact contra
   - `platform_config/global_tiers` (`providerModels.on_demand_transport.tiers.STANDARD` & `GOLD`)
   - `platform_config/global` (`maintenanceMode`, `maintenanceMessage`, `taxiPortalMode`, `taxiComingSoon`)
 - **Driver & Ride Collections:**
-  - `users/{uid}` (driver profile, preferences, `verificationDocs`, `earningsGoals`, `weeklySchedule`, `requirePasscode`, `stripeAccountId`, `driverApproved`, `pendingPlatformFees`)
+  - `users/{uid}` (driver profile, `capabilities`, `vehicleMake`, `vehicleModel`, `vehicleColor`, `vehicleInfo`, `vehiclePlate` / `licensePlate` / `registrationPlate` / `plateNumber`, `totalBusinessMileage`, `proFeaturesEnabled`, `subscriptionType`, `earningsReportExport`, preferences, `verificationDocs`, `earningsGoals`, `weeklySchedule` with custom `startTime`/`endTime`, `requirePasscode`, `muteHeadsUpVolume`, `muteRideOfferAlerts`, `stripeAccountId`, `driverApproved`, `pendingPlatformFees`)
   - `live_tracking/{uid}` (always written with `SetOptions.merge()` by Android so server-stamped `passengerId`/`riderId`/`activeRideId` are preserved; includes `isOnline`, `driverId`, `lat`, `lng`, `heading`, `speed`, `vehicleCategory`, `vehicleCategories`, `isPetFriendly`, `isStackingEnabled`, `isLastJob`, `destinationModeActive`, `homeLat`, `homeLng`, `zoneEnabled`, `zoneMaxDistance`, `dropoffLat`, `dropoffLng`)
   - `live_tracking/{passengerId}` (observed read-only by Android during active rides for passenger live blue GPS dot)
   - `driver_status/{uid}` (Android writes both `online` and `isOnline`, plus `isBusy`, `status`, `lat`, `lng` — compatible with both `server.ts` fairness dispatch and web UI)
-  - `ride_requests/{rideId}` + `ride_requests/{rideId}/chat/{messageId}`
-  - `driver_metrics/{uid}`, `driver_expenses`, `notifications`, `reported_hazards`, `partners`
+  - `ride_requests/{rideId}` + `ride_requests/{rideId}/chat/{messageId}` (Android reads `priorityFee`, `abandonmentFee`, `stops`, `currentStopIndex`, `isModifiedByPassenger`, `liveEtaSeconds`, `stackedDriverDelay`, `riderNotes`, `handshakeCode`, `paymentUrl`)
+  - `driver_metrics/{uid}`, `driver_expenses/{expenseId}` (full Create / Edit / Delete with 7 categories & receipt photos), `notifications`, `reported_hazards`, `partners`
 
 ### 2. Verified REST API Endpoints (All 32 Routes Confirmed Against `server.ts`)
 | Group | Method & Path | Auth |
@@ -443,14 +494,30 @@ The Android Driver app already implements and expects the following exact contra
 | Notifications & WhatsApp | `POST /api/notifications/register-token`, `POST /api/notifications/unregister-token`, `POST /api/chat-push`, `GET /api/notifications/preferences`, `PATCH /api/notifications/preferences`, `POST /api/notifications/whatsapp-activation-link`, `POST /api/notifications/presence`, `PATCH /api/notifications/{id}/read`, `DELETE /api/notifications/{id}` | Bearer JWT |
 | Chat Safety | `GET /api/chat/blocks`, `POST /api/chat/report-block`, `DELETE /api/chat/blocks/{targetUserId}` | Bearer JWT |
 | Driver Ops | `POST /api/driver/metrics/heartbeat`, `GET /api/rides/demand-zones`, `POST /api/driver/analytics-pulse` | Bearer JWT |
-| Ride Lifecycle | `POST /api/rides/accept`, `POST /api/rides/transition`, `POST /api/rides/create-trip-payment`, `POST /api/rides/complete`, `POST /api/rides/cancel` | Bearer JWT |
+| Ride Lifecycle | `POST /api/rides/accept`, `POST /api/rides/decline` *(P1-2)*, `POST /api/rides/transition` *(incl. `update_eta` P1-3)*, `POST /api/rides/create-trip-payment`, `POST /api/rides/complete`, `POST /api/rides/cancel`, `POST /api/rides/rate-passenger` *(P1-4)* | Bearer JWT |
 | Stripe & Billing | `GET /api/driver/stripe-balance/{driverId}`, `POST /api/driver/stripe-payout/{driverId}`, `GET /api/stripe/account-status`, `POST /api/stripe/create-connect-account`, `POST /api/stripe/create-login-link`, `GET /api/driver/fee-settlement-status`, `POST /api/driver/settle-fees`, `POST /api/create-checkout-session`, `POST /api/create-customer-portal-session`, `POST /api/cancel-subscription`, `POST /api/reactivate-subscription` | Bearer JWT |
 
 ### 3. FCM Push Channels & Data Keys (`AnyRollerMessagingService.kt`)
-- **Urgent Ride Offers Channel:** `ride_offers_urgent` (`IMPORTANCE_HIGH`, full-screen intent + ringtone + vibration)
+- **Urgent Ride Offers Channel:** `ride_offers_urgent` (`IMPORTANCE_HIGH`, Play-Policy-compliant high-priority heads-up banner with `BigTextStyle`, ringtone + vibration, **no** `USE_FULL_SCREEN_INTENT`; automatically suppressed when the app is foregrounded so the in-app Job Offer card renders cleanly without a duplicate OS banner)
   - Expected `data` keys: `type` (`"ride_offer"` | `"new_ride_offer"` | `"stacked_ride_offer"`), `rideId`, `pickupAddress`, `dropoffAddress`, `pickupLat`, `pickupLng`, `dropoffLat`, `dropoffLng`, `fareEstimate`, `surgeMultiplier`, `vehicleCategory`, `distanceMiles`, `offeredAtMs`, `expiresAtMs`.
 - **Chat & Ride Updates Channel:** `ride_chat_updates` (`IMPORTANCE_DEFAULT`)
   - Expected `data` keys: `type` (`"chat"` | `"ride_cancelled"` | `"ride_expired"` | `"ride_accepted"` | `"ride_update"`), `rideId`, `title`, `body`.
+
+### 4. Android Full Web-Parity Sync Notes (v2 — Complete A–Z Mirror)
+The Android Driver app now mirrors **100% of the Web Driver Terminal (`src/components/driver/*`)** while keeping the live Map Window strictly clutter-free (Owner-Locked transparent `#2563EB` Navigation HUD):
+- **Live Cockpit & Navigation:** 3D Head-Up camera (50° tilt, bearing follow) with manual map-drag pause & Recenter/Head-Up toggle, step-by-step live turn-by-turn voice guidance (1000m / 400m / 100m prep + ≤50m double-turn chaining + arrival zoom), cost-capped off-route recalculation (max 3/leg with warning banner), 2-tap Decline→`CONFIRM` on incoming & stacked offers, horizontal `SwipeConfirmButton` on all 4 critical trip actions (`MARK AS ARRIVED`, `START TRIP`, `GO NEXT`, `COMPLETE`), collapsible active trip card, 10s floating incoming chat quick-reply popup + two-way spoken chat read-aloud, fullscreen chat photo lightbox, real-time 3-tier pulsing battery pill, and 1-tap `CANCEL` on 3s hazard countdown.
+- **Earnings, Expenses & Tax:** 4-period Earnings (`Today | Week | Month | Year`) + Custom Date-Range Statement + CSV export; Expenses with all 7 categories, Add/Edit/Delete, custom date, Month/Year filters, Category Donut chart, and HMRC Auto-Tracked Business Mileage card; Trip History & My Jobs with Day/Month/Year filters and tap-to-expand full fare breakdown.
+- **Documents, Availability, Zones, Inbox & Menu:** Documents Active Vehicle + plate badge + "Book an MOT via AnyTrader"; Weekly Availability Daily Driving Hours cap + custom `HH:mm` start/end hours; Zones inline Home Base editor; Analytics Top Earner priority badge; Inbox tap-to-open detail modal with contextual deep-links (`Open Documents` / `Open Earnings`); Menu accidental-tap confirmation dialogs on all sensitive shift, passcode, and audio toggles.
+
+### 5. Part 2 Industry-Standard Android Cockpit Enhancements (Zero Breaking Backend Changes)
+All 15 Part 2 features are implemented natively on Android while keeping the **active ride map strictly clutter-free** and requiring **zero breaking changes** on the backend:
+- **Offer Intelligence (Offer Cards Only):** Live `£/hr` & `£/mi` profitability estimator, smart tags (`AIRPORT`, `RAIL STATION`, `LONG TRIP`), and Direction-of-Travel compass pill (`Heading NE • X.X mi` / `Toward Home`).
+- **Auto-Launch External Navigation (ON by Default):** Automatically launches Google Maps or Waze (with multi-stop waypoints) on Accept Ride and Start Trip; toggleable OFF anytime in *Navigation & Cockpit Display* settings.
+- **Cockpit Ergonomics & Display:** Picture-in-Picture (PiP) mini status window when switching to Google Maps/Waze, Auto-Night / Dark / Daylight high-contrast map theme, Keep Screen Awake (ON by default), and optional Auto-Brightness Boost (OFF by default).
+- **Coffee Cup Break Mode (IDLE-Only):** 15m / 30m / Open break pauses incoming offers without stopping location tracking or losing shift streak. Writes `status: "busy", isBusy: true, onBreak: true` to `driver_status/{uid}` (and `status: "busy"` to `live_tracking/{uid}`) until resumed, so existing server dispatch naturally skips the driver during break.
+- **Safety, Speed & Fatigue:** Live `mph` readout integrated cleanly inside the Owner-Locked transparent `#2563EB` Navigation HUD with gentle voice/haptic over-speed alert (`Off / 30–70 mph`); 1-Tap Safety Toolkit (live UK GPS address/postcode, Share Live Location with trusted contact, Quick Incident Log, 999 SOS) housed inside the existing Hazard/SOS modal (zero extra map buttons); Smart Fatigue Break Reminder (`Off / 2h–5h`, IDLE & Menu only).
+- **Automation, Shift Analytics & Tax OCR:** Live `This Shift` summary (duration, trips, `£/hr`, paid vs. deadhead miles) in Menu & Earnings; opt-in Auto-Accept Mode (OFF by default, min fare £ & max pickup miles); on-device ML Kit Receipt OCR photo scanner in Driver Expenses; and Play-Policy-compliant local 45m & 15m Scheduled Job Reminder alarms (`AlarmManager.setAndAllowWhileIdle`).
+- **Logically Grouped Driver Menu & Settings:** Reorganized into 6 operational sections (*1. Shift & Dispatch Controls → 2. Navigation & Cockpit Display → 3. Safety, Audio & Alerts → 4. Vehicle & Service Tiers → 5. Operations & Business → 6. AnyTrader Ecosystem & Account*).
 
 ---
 
@@ -464,7 +531,7 @@ Before shipping the Android APK connected to the live platform:
    - Ensure **Maps SDK for Android** and **Directions API** are enabled on the Maps API key configured in AI Studio Secrets (`MAPS_API_KEY`).
    - If using key restrictions, whitelist package `com.anyroller.driver` + its SHA-1 fingerprints.
 3. **Backend Base URL & Stripe Return Targets:**
-   - Ensure `ANYROLLER_API_BASE_URL` in the Android build points to the live production Cloud Run URL (not a dev preview URL).
+   - Ensure `API_BASE_URL` in the Android build points to the live production Cloud Run URL (not a dev preview URL).
    - Ensure `sanitizeRedirectUrl` on the backend allows the return URLs sent by Stripe onboarding/checkout (`returnTarget: "driver-terminal"`).
 4. **Deploy Updated `firestore.rules` (Main Repo Only):**
    - Run existing Firestore rules unit tests in the main repo before deploying (`firebase deploy --only firestore:rules`).

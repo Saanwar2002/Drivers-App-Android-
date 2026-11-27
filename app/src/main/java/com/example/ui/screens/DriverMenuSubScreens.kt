@@ -26,18 +26,25 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Build
 import androidx.compose.material.icons.rounded.CloudUpload
 import androidx.compose.material.icons.rounded.DeleteForever
+import androidx.compose.material.icons.rounded.DirectionsCar
 import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Shield
+import androidx.compose.material.icons.rounded.Timer
+import androidx.compose.material.icons.rounded.WorkspacePremium
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
@@ -87,6 +94,7 @@ fun DriverDocumentsScreen(
     viewModel: DriverTerminalViewModel,
     onBack: () -> Unit
 ) {
+    val context = LocalContext.current
     val requiredDocs = listOf(
         "dvla_license" to "UK Driving Licence (DVLA)",
         "phv_license" to "PHV / Council Driver Badge",
@@ -96,6 +104,7 @@ fun DriverDocumentsScreen(
     )
     var uploadingType by remember { mutableStateOf<String?>(null) }
     var expiryDateInput by remember { mutableStateOf("2027-01-01") }
+    val verifiedCount = state.profile.verificationDocs.count { it.status.lowercase() in setOf("approved", "verified") }
 
     // Zero-permission SAF document picker (PDF / Images — no storage permissions required)
     val docPicker = rememberLauncherForActivityResult(
@@ -124,6 +133,62 @@ fun DriverDocumentsScreen(
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            // Active Vehicle Summary Card (Mirrors DriverDocuments.tsx)
+            Surface(
+                color = AnyRollerBgSecondary,
+                shape = RoundedCornerShape(18.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, AnyRollerGreen.copy(alpha = 0.45f), RoundedCornerShape(18.dp))
+            ) {
+                Row(
+                    modifier = Modifier.padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                        Box(
+                            modifier = Modifier
+                                .size(44.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(AnyRollerGreen.copy(alpha = 0.16f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Rounded.DirectionsCar, contentDescription = null, tint = AnyRollerGreen)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column {
+                            Text(
+                                text = state.profile.resolvedVehicleTitle,
+                                style = MaterialTheme.typography.titleSmall,
+                                color = AnyRollerTextPrimary
+                            )
+                            Text(
+                                text = "$verifiedCount/5 compliance docs verified • ${state.profile.vehicleCategory.uppercase()}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = AnyRollerTextMuted
+                            )
+                        }
+                    }
+                    if (state.profile.vehiclePlate.isNotBlank()) {
+                        Surface(
+                            color = AnyRollerOrange.copy(alpha = 0.18f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.border(1.dp, AnyRollerOrange, RoundedCornerShape(8.dp))
+                        ) {
+                            Text(
+                                text = state.profile.vehiclePlate.uppercase(),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = JetBrainsMonoFont,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = AnyRollerOrange,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
             Surface(
                 onClick = { viewModel.openOverlay(DriverOverlayRoute.INSURANCE) },
                 color = AnyRollerBlue.copy(alpha = 0.14f),
@@ -196,6 +261,22 @@ fun DriverDocumentsScreen(
                     }
                 }
             }
+
+            // Book an MOT via AnyTrader Mechanics (Mirrors DriverDocuments.tsx)
+            OutlinedButton(
+                onClick = { ExternalIntentHelpers.openCustomTab(context, "https://www.anytrader.co.uk/mechanics") },
+                shape = RoundedCornerShape(14.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AnyRollerBlue.copy(alpha = 0.6f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .testTag("book_mot_anytrader_button")
+            ) {
+                Icon(Icons.Rounded.Build, contentDescription = null, tint = AnyRollerBlue, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Book an MOT via AnyTrader", color = AnyRollerBlue, fontWeight = FontWeight.Bold)
+            }
+
             Spacer(Modifier.height(20.dp))
         }
     }
@@ -270,6 +351,15 @@ fun DriverAvailabilityScreen(
     val days = listOf("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
     var schedule by remember(state.profile.weeklySchedule) { mutableStateOf(state.profile.weeklySchedule) }
 
+    val drivenHours = state.metrics.onlineSecondsToday / 3600.0
+    val maxHours = state.platformConfig.maxDailyDriverHours.coerceAtLeast(1.0)
+    val drivingProgress = (drivenHours / maxHours).toFloat().coerceIn(0f, 1f)
+    val drivingColor = when {
+        drivingProgress >= 0.9f -> AnyRollerRed
+        drivingProgress >= 0.75f -> AnyRollerOrange
+        else -> AnyRollerGreen
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -286,6 +376,45 @@ fun DriverAvailabilityScreen(
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
+            // Daily Driving Hours Limit Card (Mirrors DriverAvailability.tsx safety header)
+            Surface(
+                color = AnyRollerBgSecondary,
+                shape = RoundedCornerShape(18.dp),
+                modifier = Modifier.fillMaxWidth().border(1.dp, drivingColor.copy(alpha = 0.5f), RoundedCornerShape(18.dp))
+            ) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.Timer, contentDescription = null, tint = drivingColor, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Daily Driving Hours Limit", style = MaterialTheme.typography.titleSmall, color = AnyRollerTextPrimary)
+                        }
+                        Text(
+                            "%.1f / %.0f hrs".format(drivenHours, maxHours),
+                            style = MaterialTheme.typography.labelLarge,
+                            fontFamily = JetBrainsMonoFont,
+                            color = drivingColor,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    LinearProgressIndicator(
+                        progress = { drivingProgress },
+                        color = drivingColor,
+                        trackColor = AnyRollerBgPrimary,
+                        modifier = Modifier.fillMaxWidth().height(7.dp).clip(RoundedCornerShape(4.dp))
+                    )
+                    Text(
+                        "Safety cap resets automatically at midnight UK time.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = AnyRollerTextMuted
+                    )
+                }
+            }
+
             days.forEach { day ->
                 val current = schedule[day] ?: DaySchedule("anytime")
                 Surface(
@@ -296,7 +425,7 @@ fun DriverAvailabilityScreen(
                     Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(day, style = MaterialTheme.typography.titleSmall, color = AnyRollerTextPrimary)
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
-                            listOf("anytime" to "Anytime", "specific" to "08:00–18:00", "unavailable" to "Off").forEach { (key, label) ->
+                            listOf("anytime" to "Anytime", "specific" to "Custom Hours", "unavailable" to "Off").forEach { (key, label) ->
                                 val sel = current.status == key
                                 Surface(
                                     onClick = {
@@ -306,7 +435,7 @@ fun DriverAvailabilityScreen(
                                     },
                                     shape = RoundedCornerShape(10.dp),
                                     color = if (sel) AnyRollerGreen else AnyRollerBgTertiary,
-                                    modifier = Modifier.weight(1f)
+                                    modifier = Modifier.weight(1f).testTag("avail_${day.lowercase()}_$key")
                                 ) {
                                     Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(vertical = 8.dp)) {
                                         Text(
@@ -317,6 +446,52 @@ fun DriverAvailabilityScreen(
                                         )
                                     }
                                 }
+                            }
+                        }
+
+                        if (current.status == "specific") {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                OutlinedTextField(
+                                    value = current.startTime ?: "08:00",
+                                    onValueChange = { v ->
+                                        schedule = schedule.toMutableMap().apply {
+                                            this[day] = current.copy(startTime = v.take(5))
+                                        }
+                                    },
+                                    label = { Text("Start (HH:mm)") },
+                                    singleLine = true,
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = AnyRollerGreen,
+                                        unfocusedBorderColor = AnyRollerBorder,
+                                        focusedContainerColor = AnyRollerBgInput,
+                                        unfocusedContainerColor = AnyRollerBgInput,
+                                        focusedTextColor = AnyRollerTextPrimary,
+                                        unfocusedTextColor = AnyRollerTextPrimary
+                                    ),
+                                    modifier = Modifier.weight(1f).testTag("avail_start_${day.lowercase()}")
+                                )
+                                OutlinedTextField(
+                                    value = current.endTime ?: "18:00",
+                                    onValueChange = { v ->
+                                        schedule = schedule.toMutableMap().apply {
+                                            this[day] = current.copy(endTime = v.take(5))
+                                        }
+                                    },
+                                    label = { Text("End (HH:mm)") },
+                                    singleLine = true,
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = AnyRollerGreen,
+                                        unfocusedBorderColor = AnyRollerBorder,
+                                        focusedContainerColor = AnyRollerBgInput,
+                                        unfocusedContainerColor = AnyRollerBgInput,
+                                        focusedTextColor = AnyRollerTextPrimary,
+                                        unfocusedTextColor = AnyRollerTextPrimary
+                                    ),
+                                    modifier = Modifier.weight(1f).testTag("avail_end_${day.lowercase()}")
+                                )
                             }
                         }
                     }
@@ -349,6 +524,7 @@ fun DriverZonesScreen(
     var sliderVal by remember(state.profile.zoneMaxDistance) {
         mutableFloatStateOf(state.profile.zoneMaxDistance.toFloat().coerceIn(2f, 50f))
     }
+    var showEditHomeDialog by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -366,6 +542,38 @@ fun DriverZonesScreen(
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
+            // Home Location Center Card (Mirrors DriverZones.tsx)
+            Surface(
+                color = AnyRollerBgSecondary,
+                shape = RoundedCornerShape(20.dp),
+                modifier = Modifier.fillMaxWidth().border(1.dp, AnyRollerBorder, RoundedCornerShape(20.dp))
+            ) {
+                Row(
+                    modifier = Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                        Icon(Icons.Rounded.Home, contentDescription = null, tint = AnyRollerGreen)
+                        Spacer(Modifier.width(10.dp))
+                        Column {
+                            Text("Zone Center (Home Base)", style = MaterialTheme.typography.titleSmall, color = AnyRollerTextPrimary)
+                            Text(
+                                text = state.profile.homeAddress?.takeIf { it.isNotBlank() } ?: "Not set — tap Edit to set UK postcode",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = AnyRollerTextMuted
+                            )
+                        }
+                    }
+                    TextButton(
+                        onClick = { showEditHomeDialog = true },
+                        modifier = Modifier.testTag("zones_edit_home_button")
+                    ) {
+                        Text("Edit", color = AnyRollerGreen, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
             Surface(
                 color = AnyRollerBgSecondary,
                 shape = RoundedCornerShape(20.dp),
@@ -435,6 +643,37 @@ fun DriverZonesScreen(
             }
         }
     }
+
+    if (showEditHomeDialog) {
+        var homeInput by remember { mutableStateOf(state.profile.homeAddress ?: "") }
+        AlertDialog(
+            onDismissRequest = { showEditHomeDialog = false },
+            containerColor = AnyRollerBgSecondary,
+            title = { Text("Edit Zone Home Location", color = AnyRollerTextPrimary) },
+            text = {
+                OutlinedTextField(
+                    value = homeInput,
+                    onValueChange = { homeInput = it },
+                    label = { Text("UK Postcode or Address") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.saveHomeDestination(
+                        address = homeInput,
+                        fallbackLat = state.driverLocation.lat,
+                        fallbackLng = state.driverLocation.lng
+                    )
+                    showEditHomeDialog = false
+                }) { Text("Save", color = AnyRollerGreen) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEditHomeDialog = false }) { Text("Cancel", color = AnyRollerTextMuted) }
+            }
+        )
+    }
 }
 
 @Composable
@@ -444,6 +683,7 @@ fun DriverAnalyticsScreen(
     onBack: () -> Unit
 ) {
     val p = state.profile
+    val isTopEarner = p.rating >= 4.8 && p.acceptanceRate >= 85.0
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -460,6 +700,22 @@ fun DriverAnalyticsScreen(
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            if (isTopEarner) {
+                Surface(
+                    color = AnyRollerOrange.copy(alpha = 0.14f),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.fillMaxWidth().border(1.dp, AnyRollerOrange.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+                ) {
+                    Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Rounded.WorkspacePremium, contentDescription = null, tint = AnyRollerOrange)
+                        Spacer(Modifier.width(10.dp))
+                        Column {
+                            Text("Top Earner • High Priority Tier", style = MaterialTheme.typography.titleSmall, color = AnyRollerOrange, fontWeight = FontWeight.Bold)
+                            Text("Your %.2f★ rating & %.0f%% acceptance boost fairness dispatch priority.".format(p.rating, p.acceptanceRate), style = MaterialTheme.typography.bodySmall, color = AnyRollerTextSecondary)
+                        }
+                    }
+                }
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
                 KpiMetricCard("Rating", "%.2f ★".format(p.rating), AnyRollerOrange, Modifier.weight(1f))
                 KpiMetricCard("Acceptance", "%.0f%%".format(p.acceptanceRate), AnyRollerGreen, Modifier.weight(1f))

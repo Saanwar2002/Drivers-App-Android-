@@ -130,6 +130,7 @@ fun DriverSignInScreen(
     onSignInGoogle: () -> Unit,
     onForgotPassword: (String) -> Unit
 ) {
+    val context = LocalContext.current
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var passwordVisible by remember { mutableStateOf(false) }
@@ -368,6 +369,58 @@ fun DriverSignInScreen(
             }
 
             Spacer(Modifier.height(16.dp))
+
+            // New Driver Onboarding CTA
+            Surface(
+                color = AnyRollerBgSecondary,
+                shape = RoundedCornerShape(18.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, AnyRollerBorder, RoundedCornerShape(18.dp))
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 14.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = "New to AnyRoller?",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = AnyRollerTextPrimary,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "Create your unified AnyTrader account and select AnyRoller Driver during setup.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = AnyRollerTextMuted,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = {
+                            ExternalIntentHelpers.openCustomTab(
+                                context,
+                                ApiClient.resolvedBaseUrl.trimEnd('/')
+                            )
+                        },
+                        shape = RoundedCornerShape(12.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, AnyRollerGreen.copy(alpha = 0.6f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("become_driver_button")
+                    ) {
+                        Text(
+                            text = "Become a Driver on AnyTrader",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = AnyRollerGreen,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
             Text(
                 text = "Connected live to AnyTrader / AnyRoller UK Fleet",
                 style = MaterialTheme.typography.labelSmall,
@@ -404,7 +457,7 @@ fun NonDriverGateScreen(email: String, onSignOut: () -> Unit) {
         primaryTag = "nondriver_signout_button",
         secondaryLabel = "Open AnyTrader Driver Portal",
         onSecondary = {
-            ExternalIntentHelpers.openCustomTab(context, "${ApiClient.resolvedBaseUrl.trimEnd('/')}/driver-signup")
+            ExternalIntentHelpers.openCustomTab(context, ApiClient.resolvedBaseUrl.trimEnd('/'))
         }
     )
 }

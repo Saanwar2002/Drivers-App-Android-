@@ -54,4 +54,27 @@ object GeocoderHelper {
             }.getOrNull()
         }
     }
+
+    /**
+     * Reverse-geocodes live GPS coordinates to a readable UK street address & postcode for 999 / Safety Toolkit.
+     */
+    suspend fun reverseGeocode(context: Context, lat: Double, lng: Double): String? {
+        if ((lat == 0.0 && lng == 0.0) || !Geocoder.isPresent()) return null
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val geocoder = Geocoder(context, Locale.UK)
+                val first: Address? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    suspendCancellableCoroutine { cont ->
+                        geocoder.getFromLocation(lat, lng, 1) { list ->
+                            if (cont.isActive) cont.resume(list.firstOrNull())
+                        }
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    geocoder.getFromLocation(lat, lng, 1)?.firstOrNull()
+                }
+                first?.getAddressLine(0)?.takeIf { it.isNotBlank() }
+            }.getOrNull()
+        }
+    }
 }
