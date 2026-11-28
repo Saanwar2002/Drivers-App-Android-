@@ -221,6 +221,7 @@ class DriverLocationService : Service() {
                     lng = loc.longitude,
                     heading = loc.bearing,
                     speedMps = loc.speed,
+                    accuracyMeters = loc.accuracy,
                     hasRealFix = true
                 )
                 UrgentPushEventBus.updateLocation(snapshot)

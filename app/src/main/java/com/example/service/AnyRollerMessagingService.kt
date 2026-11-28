@@ -1,6 +1,5 @@
 package com.example.service
 
-import android.app.ActivityManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -49,7 +48,7 @@ class AnyRollerMessagingService : FirebaseMessagingService() {
                 "Urgent Ride Offers",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                description = "Time-critical incoming passenger ride dispatch offers."
+                description = "Time-critical incoming passenger ride dispatch offers and queued ride alerts."
                 enableVibration(true)
                 vibrationPattern = longArrayOf(0L, 400L, 200L, 400L, 200L, 600L)
                 setSound(ringtoneUri, audioAttrs)
@@ -67,6 +66,108 @@ class AnyRollerMessagingService : FirebaseMessagingService() {
 
             mgr.createNotificationChannel(offerChannel)
             mgr.createNotificationChannel(chatChannel)
+        }
+
+        /**
+         * Posts a high-priority 15s heads-up notification banner over Google Maps / Waze
+         * (including when AnyRoller is shrunk into PiP). Deduplicated by `rideId.hashCode()`.
+         */
+        fun showUrgentOfferNotification(
+            context: Context,
+            rideId: String,
+            fareEstimate: Double,
+            pickupAddress: String,
+            dropoffAddress: String,
+            isStacked: Boolean = false,
+            timeoutMs: Long = 15_000L
+        ) {
+            if (rideId.isBlank()) return
+            createNotificationChannels(context)
+            val intent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra(EXTRA_OFFER_RIDE_ID, rideId)
+            }
+            val pi = PendingIntent.getActivity(
+                context,
+                rideId.hashCode(),
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val fareLabel = "£%.2f".format(fareEstimate)
+            val title = if (isStacked) {
+                "Stacked Next Ride • $fareLabel"
+            } else {
+                "New Ride Offer • $fareLabel"
+            }
+            val routeSummary = "${pickupAddress.ifBlank { "Nearby Pickup" }} → ${dropoffAddress.ifBlank { "Destination" }}"
+            val expandedText = if (isStacked) {
+                "$routeSummary\nQueued for after your current drop-off — tap to Accept or Decline."
+            } else {
+                "$routeSummary\nTap to Accept or Decline."
+            }
+            val notification = NotificationCompat.Builder(context, CHANNEL_RIDE_OFFERS)
+                .setSmallIcon(R.drawable.ic_launcher_foreground)
+                .setContentTitle(title)
+                .setContentText(routeSummary)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(expandedText))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setDefaults(NotificationCompat.DEFAULT_ALL)
+                .setAutoCancel(true)
+                .setTimeoutAfter(timeoutMs.coerceIn(5_000L, 60_000L))
+                .setContentIntent(pi)
+                .build()
+
+            val mgr = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            runCatching { mgr.notify(rideId.hashCode(), notification) }
+        }
+
+        /**
+         * Immediately dismisses an offer heads-up notification once accepted, declined, cancelled, or expired.
+         */
+        fun cancelOfferNotification(context: Context, rideId: String) {
+            if (rideId.isBlank()) return
+            val mgr = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+            runCatching { mgr.cancel(rideId.hashCode()) }
+        }
+
+        /**
+         * Posts a prominent heads-up alert over Google Maps / Waze when a passenger cancels
+         * an already-accepted stacked (queued) ride so the driver is informed without losing
+         * their active trip navigation.
+         */
+        fun showStackedCancelledNotification(
+            context: Context,
+            rideId: String,
+            message: String
+        ) {
+            createNotificationChannels(context)
+            val intent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            }
+            val notifId = ("stacked_cancel_$rideId").hashCode()
+            val pi = PendingIntent.getActivity(
+                context,
+                notifId,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notification = NotificationCompat.Builder(context, CHANNEL_RIDE_OFFERS)
+                .setSmallIcon(R.drawable.ic_launcher_foreground)
+                .setContentTitle("Queued Next Ride Cancelled")
+                .setContentText(message)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setCategory(NotificationCompat.CATEGORY_STATUS)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setAutoCancel(true)
+                .setTimeoutAfter(20_000L)
+                .setContentIntent(pi)
+                .build()
+
+            val mgr = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            runCatching { mgr.notify(notifId, notification) }
         }
     }
 
@@ -121,13 +222,23 @@ class AnyRollerMessagingService : FirebaseMessagingService() {
                     expiresAtMs = expiresAt
                 )
                 UrgentPushEventBus.emit(UrgentPushEvent.RideOffer(offer))
-                if (!isAppInForeground()) {
-                    showUrgentOfferNotification(offer)
+                // Show high-priority heads-up banner whenever app is backgrounded OR shrunk in PiP over Google Maps/Waze
+                if (!UrgentPushEventBus.isFullScreenVisible.value) {
+                    showUrgentOfferNotification(
+                        context = applicationContext,
+                        rideId = offer.rideId,
+                        fareEstimate = offer.fareEstimate,
+                        pickupAddress = offer.pickupAddress,
+                        dropoffAddress = offer.dropoffAddress,
+                        isStacked = (type == "stacked_ride_offer"),
+                        timeoutMs = (offer.expiresAtMs - now).coerceIn(5_000L, 60_000L)
+                    )
                 }
             }
 
             "ride_cancelled", "ride_expired" -> {
                 if (rideId.isNotBlank()) {
+                    cancelOfferNotification(applicationContext, rideId)
                     UrgentPushEventBus.emit(
                         UrgentPushEvent.RideCancelled(rideId, data["reason"])
                     )
@@ -141,6 +252,7 @@ class AnyRollerMessagingService : FirebaseMessagingService() {
 
             "ride_accepted" -> {
                 if (rideId.isNotBlank()) {
+                    cancelOfferNotification(applicationContext, rideId)
                     UrgentPushEventBus.emit(UrgentPushEvent.RideAcceptedElsewhere(rideId))
                 }
             }
@@ -154,47 +266,6 @@ class AnyRollerMessagingService : FirebaseMessagingService() {
                 showStandardNotification(title, body, rideId)
             }
         }
-    }
-
-    private fun isAppInForeground(): Boolean {
-        val am = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return false
-        val appProcesses = am.runningAppProcesses ?: return false
-        val pkg = packageName
-        return appProcesses.any { proc ->
-            proc.processName == pkg &&
-                proc.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
-        }
-    }
-
-    private fun showUrgentOfferNotification(offer: IncomingOfferPush) {
-        val intent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            putExtra(EXTRA_OFFER_RIDE_ID, offer.rideId)
-        }
-        val pi = PendingIntent.getActivity(
-            this,
-            offer.rideId.hashCode(),
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val fareLabel = "£%.2f".format(offer.fareEstimate)
-        val routeSummary = "${offer.pickupAddress} → ${offer.dropoffAddress}"
-        val notification = NotificationCompat.Builder(this, CHANNEL_RIDE_OFFERS)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle("New Ride Offer • $fareLabel")
-            .setContentText(routeSummary)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(routeSummary))
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setDefaults(NotificationCompat.DEFAULT_ALL)
-            .setAutoCancel(true)
-            .setTimeoutAfter(15_000L)
-            .setContentIntent(pi)
-            .build()
-
-        val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        mgr.notify(offer.rideId.hashCode(), notification)
     }
 
     private fun showStandardNotification(title: String, body: String, rideId: String) {

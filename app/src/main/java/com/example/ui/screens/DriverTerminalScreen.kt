@@ -63,7 +63,21 @@ import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.ShareLocation
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Speed
+import androidx.compose.material.icons.rounded.ForkLeft
+import androidx.compose.material.icons.rounded.ForkRight
+import androidx.compose.material.icons.rounded.Merge
+import androidx.compose.material.icons.rounded.RoundaboutLeft
+import androidx.compose.material.icons.rounded.RoundaboutRight
+import androidx.compose.material.icons.rounded.Straight
 import androidx.compose.material.icons.rounded.Traffic
+import androidx.compose.material.icons.rounded.TurnLeft
+import androidx.compose.material.icons.rounded.TurnRight
+import androidx.compose.material.icons.rounded.TurnSharpLeft
+import androidx.compose.material.icons.rounded.TurnSharpRight
+import androidx.compose.material.icons.rounded.TurnSlightLeft
+import androidx.compose.material.icons.rounded.TurnSlightRight
+import androidx.compose.material.icons.rounded.UTurnLeft
+import androidx.compose.material.icons.rounded.UTurnRight
 import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material.icons.rounded.WrongLocation
 import androidx.compose.material3.AlertDialog
@@ -151,6 +165,7 @@ import kotlinx.coroutines.launch
 fun DriverTerminalRoot(
     state: DriverTerminalUiState,
     viewModel: DriverTerminalViewModel,
+    isSplitScreenMode: Boolean = false,
     onSignOut: () -> Unit,
     onExportGdpr: () -> Unit,
     onDeleteAccount: ((Boolean, String) -> Unit) -> Unit
@@ -274,12 +289,26 @@ fun DriverTerminalRoot(
                 .padding(bottom = innerPadding.calculateBottomPadding())
         ) {
             when (state.activeTab) {
-                DriverTab.TERMINAL -> TerminalMapCockpit(
-                    state = state,
-                    viewModel = viewModel,
-                    hasLocationPermission = hasLocationPermission.value,
-                    onToggleOnline = onToggleOnlineClicked
-                )
+                DriverTab.TERMINAL -> {
+                    val useSplitCockpit = isSplitScreenMode && (
+                        state.activeRide != null ||
+                            state.incomingOffer != null ||
+                            state.reviewRide != null
+                        )
+                    if (useSplitCockpit) {
+                        SplitScreenRideCockpit(
+                            state = state,
+                            viewModel = viewModel
+                        )
+                    } else {
+                        TerminalMapCockpit(
+                            state = state,
+                            viewModel = viewModel,
+                            hasLocationPermission = hasLocationPermission.value,
+                            onToggleOnline = onToggleOnlineClicked
+                        )
+                    }
+                }
                 DriverTab.EARNINGS -> DriverEarningsScreen(
                     state = state,
                     viewModel = viewModel
@@ -380,6 +409,235 @@ fun DriverTerminalRoot(
     }
 }
 
+/**
+ * Smart Android Split-Screen Cockpit Mode:
+ * When Google Maps / Waze occupies the top pane in Split-Screen, hides the duplicate map
+ * and fills the bottom pane cleanly with the full readable Ride Info Card, Swipe Slider,
+ * Stacked Offers, Payment QR, Review, and 1-tap Menu / Hazard / External Nav controls.
+ */
+@Composable
+private fun SplitScreenRideCockpit(
+    state: DriverTerminalUiState,
+    viewModel: DriverTerminalViewModel
+) {
+    val context = LocalContext.current
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(AnyRollerBgPrimary)
+            .statusBarsPadding()
+            .padding(horizontal = 10.dp, vertical = 8.dp)
+            .testTag("split_screen_ride_cockpit"),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        // Slim Split-Screen Top Bar: Live Stage + ETA/Distance + Speed + Hazard + Nav + Menu
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                val liveEta = state.liveRemainingEtaMinutes ?: state.activeRoute.etaMinutes
+                val liveDist = state.liveRemainingDistanceMeters?.takeIf { it > 0 }?.let { formatUkRoadDistance(it) }
+                    ?: state.activeRoute.distanceText
+                val metricLine = buildString {
+                    if (liveEta != null) append("$liveEta min")
+                    if (!liveDist.isNullOrBlank()) {
+                        if (isNotEmpty()) append(" • ")
+                        append(liveDist)
+                    }
+                    if (state.driverLocation.hasRealFix) {
+                        if (isNotEmpty()) append(" • ")
+                        append("${state.currentSpeedMph} mph")
+                    }
+                }
+                Text(
+                    text = "SPLIT-SCREEN COCKPIT",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = AnyRollerBlue,
+                    fontWeight = FontWeight.ExtraBold
+                )
+                if (metricLine.isNotBlank()) {
+                    Text(
+                        text = metricLine,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (state.isOverSpeedAlert) AnyRollerRed else AnyRollerGreen,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Surface(
+                    onClick = { viewModel.setHazardModalVisible(true) },
+                    shape = CircleShape,
+                    color = AnyRollerBgSecondary,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .border(1.dp, AnyRollerOrange.copy(alpha = 0.7f), CircleShape)
+                        .testTag("split_screen_hazard_button")
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(Icons.Rounded.Bolt, contentDescription = "Safety & Hazard", tint = AnyRollerOrange, modifier = Modifier.size(22.dp))
+                    }
+                }
+                val active = state.activeRide
+                if (active != null && state.rideState in setOf(TerminalRideState.EN_ROUTE_PICKUP, TerminalRideState.IN_PROGRESS)) {
+                    Surface(
+                        onClick = {
+                            val isDropoff = state.rideState == TerminalRideState.IN_PROGRESS
+                            val waypoints = if (isDropoff) {
+                                active.stops.drop(active.currentStopIndex.coerceAtLeast(0))
+                                    .filter { it.lat != 0.0 || it.lng != 0.0 }
+                                    .map { it.lat to it.lng }
+                            } else emptyList()
+                            ExternalIntentHelpers.launchTurnByTurnNavigation(
+                                context = context,
+                                lat = if (isDropoff) active.dropoffLat else active.pickupLat,
+                                lng = if (isDropoff) active.dropoffLng else active.pickupLng,
+                                preferredNavApp = state.profile.defaultNavApp,
+                                waypoints = waypoints
+                            )
+                        },
+                        shape = CircleShape,
+                        color = AnyRollerBlue,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .testTag("split_screen_nav_button")
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(Icons.Rounded.Navigation, contentDescription = "Launch External Nav", tint = Color.White, modifier = Modifier.size(21.dp))
+                        }
+                    }
+                }
+                Surface(
+                    onClick = { viewModel.openOverlay(DriverOverlayRoute.MENU) },
+                    shape = CircleShape,
+                    color = AnyRollerBgSecondary,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .border(1.dp, AnyRollerBorder, CircleShape)
+                        .testTag("split_screen_menu_button")
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(Icons.Rounded.Menu, contentDescription = "Open Menu", tint = AnyRollerTextPrimary, modifier = Modifier.size(22.dp))
+                    }
+                }
+            }
+        }
+
+        // Stacked Offer Banner right at the top when applicable
+        if (state.stackedRideOffer != null && state.rideState == TerminalRideState.IN_PROGRESS) {
+            StackedRideOfferBanner(
+                offer = state.stackedRideOffer,
+                secondsLeft = state.stackedOfferSecondsLeft,
+                isBusy = state.isBusy,
+                driverLat = state.driverLocation.lat,
+                driverLng = state.driverLocation.lng,
+                hasRealDriverFix = state.driverLocation.hasRealFix,
+                homeLat = state.profile.homeLat,
+                homeLng = state.profile.homeLng,
+                onAccept = { viewModel.acceptOffer(isStacked = true) },
+                onDecline = { viewModel.declineOffer(isStacked = true) }
+            )
+        }
+
+        // Main Split-Screen Scrollable Ride Info Card / Offer / Payment / Review
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+        ) {
+            when (state.rideState) {
+                TerminalRideState.OFFER -> {
+                    state.incomingOffer?.let { offer ->
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            IncomingRideOfferOverlay(
+                                offer = offer,
+                                secondsLeft = state.offerSecondsLeft,
+                                totalSeconds = state.platformConfig.dispatchTimeoutSeconds,
+                                isBusy = state.isBusy,
+                                driverLat = state.driverLocation.lat,
+                                driverLng = state.driverLocation.lng,
+                                hasRealDriverFix = state.driverLocation.hasRealFix,
+                                homeLat = state.profile.homeLat,
+                                homeLng = state.profile.homeLng,
+                                onAccept = { viewModel.acceptOffer(isStacked = false) },
+                                onDecline = { viewModel.declineOffer(isStacked = false) }
+                            )
+                        }
+                    }
+                }
+                TerminalRideState.EN_ROUTE_PICKUP,
+                TerminalRideState.WAITING,
+                TerminalRideState.IN_PROGRESS -> {
+                    state.activeRide?.let { ride ->
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (state.incomingChatPopup != null && !state.showChatSheet) {
+                                IncomingChatQuickReplyPopup(
+                                    passengerName = ride.passengerName,
+                                    message = state.incomingChatPopup,
+                                    onOpenChat = { viewModel.setChatSheetVisible(true) },
+                                    onQuickReply = { reply -> viewModel.sendPopupQuickReply(reply) },
+                                    onDismiss = { viewModel.dismissIncomingChatPopup() }
+                                )
+                            }
+                            ActiveTripSheetCard(
+                                ride = ride,
+                                state = state,
+                                viewModel = viewModel
+                            )
+                        }
+                    }
+                }
+                TerminalRideState.COMPLETED_PAYMENT -> {
+                    state.activeRide?.let { ride ->
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            PaymentHandshakeCard(
+                                ride = ride,
+                                state = state,
+                                viewModel = viewModel
+                            )
+                        }
+                    }
+                }
+                TerminalRideState.REVIEW -> {
+                    state.reviewRide?.let { ride ->
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            TripReviewOverlayCard(
+                                ride = ride,
+                                state = state,
+                                onSubmitRating = { stars, comment ->
+                                    viewModel.submitPassengerReview(stars, comment)
+                                }
+                            )
+                        }
+                    }
+                }
+                else -> Unit
+            }
+        }
+    }
+}
+
 @Composable
 private fun TerminalMapCockpit(
     state: DriverTerminalUiState,
@@ -416,27 +674,46 @@ private fun TerminalMapCockpit(
         }
     }
 
-    // 3D Head-Up Navigation Camera (mirrors DriverTerminal.tsx isAutoNavHeadUp + bearing/tilt)
+    // 3D Head-Up Navigation Camera (forward lookahead offset + speed-adaptive zoom + route-snapped bearing)
     LaunchedEffect(
         state.driverLocation.lat,
         state.driverLocation.lng,
         state.driverLocation.heading,
+        state.snappedRouteBearing,
+        state.currentSpeedMph,
         state.isAutoNavHeadUp,
         state.isAutoNavPaused,
         isDrivingLeg
     ) {
         if (isDrivingLeg && state.isAutoNavHeadUp && !state.isAutoNavPaused && state.driverLocation.hasRealFix) {
-            val targetBearing = if (state.driverLocation.speedMps > 1.2f) {
-                state.driverLocation.heading
-            } else {
-                cameraPositionState.position.bearing
+            val targetBearing = when {
+                state.driverLocation.speedMps > 2.2f -> state.driverLocation.heading
+                state.snappedRouteBearing != null -> state.snappedRouteBearing
+                else -> cameraPositionState.position.bearing
             }
+            val speedMph = state.currentSpeedMph
+            val adaptiveZoom = when {
+                speedMph < 20 -> 18.0f
+                speedMph <= 45 -> 17.2f
+                else -> 16.0f
+            }
+            val lookaheadMeters = when {
+                speedMph < 20 -> 55.0
+                speedMph <= 45 -> 95.0
+                else -> 145.0
+            }
+            val cameraTarget = projectLatLngAhead(
+                lat = state.driverLocation.lat,
+                lng = state.driverLocation.lng,
+                bearingDeg = targetBearing,
+                distanceMeters = lookaheadMeters
+            )
             cameraPositionState.animate(
                 update = CameraUpdateFactory.newCameraPosition(
                     CameraPosition.Builder()
-                        .target(driverLatLng)
-                        .zoom(17.5f)
-                        .tilt(45f)
+                        .target(cameraTarget)
+                        .zoom(adaptiveZoom)
+                        .tilt(48f)
                         .bearing(targetBearing)
                         .build()
                 ),
@@ -575,10 +852,11 @@ private fun TerminalMapCockpit(
                         )
                     }
                 }
-                // Live Active Route Polyline (clean single stroke, zero map clutter)
-                if (state.activeRoute.points.size >= 2) {
+                // Live Trimmed Active Route Polyline (clean single stroke ahead of car, zero map clutter)
+                val renderedRoutePoints = state.remainingRoutePoints.ifEmpty { state.activeRoute.points }
+                if (renderedRoutePoints.size >= 2) {
                     Polyline(
-                        points = state.activeRoute.points,
+                        points = renderedRoutePoints,
                         color = if (state.rideState == TerminalRideState.IN_PROGRESS) AnyRollerGreen else AnyRollerBlue,
                         width = 12f
                     )
@@ -608,28 +886,23 @@ private fun TerminalMapCockpit(
                 }
                 else -> state.activeRide.pickupAddress
             }
-            val liveStepInstruction = state.activeRoute.steps
-                .getOrNull(state.currentNavStepIndex)
-                ?.instruction
-                ?.takeIf { it.isNotBlank() }
+            val currentStep = state.activeRoute.steps.getOrNull(state.currentNavStepIndex)
+            val liveStepInstruction = currentStep?.instruction?.takeIf { it.isNotBlank() }
             val liveInstruction = liveStepInstruction
                 ?: state.activeRoute.nextManeuver?.takeIf { it.isNotBlank() }
                 ?: targetAddress
-            val stepDistLabel = state.currentStepDistanceMeters?.let { meters ->
-                when {
-                    meters >= 1000 -> "%.1f km".format(meters / 1000.0)
-                    meters >= 50 -> "${((meters + 25) / 50) * 50} m"
-                    else -> "$meters m"
-                }
-            }
+            val stepDistLabel = state.currentStepDistanceMeters?.let { formatUkRoadDistance(it) }
+            val liveRemDistText = state.liveRemainingDistanceMeters
+                ?.takeIf { it > 0 }
+                ?.let { formatUkRoadDistance(it) }
+                ?: state.activeRoute.distanceText
+            val liveEtaMins = state.liveRemainingEtaMinutes ?: state.activeRoute.etaMinutes
             val liveDistanceLabel = buildString {
                 if (!stepDistLabel.isNullOrBlank() && state.rideState != TerminalRideState.WAITING) {
                     append("Next turn $stepDistLabel • ")
                 }
-                val distText = state.activeRoute.distanceText
-                val etaMins = state.activeRoute.etaMinutes
-                if (!distText.isNullOrBlank() && etaMins != null) {
-                    append("$distText • $etaMins min")
+                if (!liveRemDistText.isNullOrBlank() && liveEtaMins != null) {
+                    append("$liveRemDistText • $liveEtaMins min")
                 } else if (state.activeRide.distanceMiles > 0.0) {
                     append("%.1f mi • %d min".format(state.activeRide.distanceMiles, state.activeRide.durationMinutes.coerceAtLeast(1)))
                 } else {
@@ -643,6 +916,7 @@ private fun TerminalMapCockpit(
                 heading = navHeading,
                 instruction = liveInstruction,
                 distanceLabel = liveDistanceLabel,
+                maneuver = if (state.rideState != TerminalRideState.WAITING) currentStep?.maneuver else null,
                 isOverSpeedAlert = state.isOverSpeedAlert,
                 modifier = Modifier
                     .align(Alignment.TopStart)
@@ -1130,14 +1404,15 @@ private fun TerminalMapCockpit(
 
 /**
  * Owner-Locked Navigation HUD:
- * Transparent background (NO black box), #2563EB text, #FFFFFF 90% drop shadow, zero text stroke.
- * Live speed integrates cleanly into the distance/ETA line without adding extra map chrome.
+ * Transparent background (NO black box), #2563EB text & maneuver arrow, #FFFFFF 90% drop shadow, zero text stroke.
+ * Live UK distance/ETA countdown & speed integrate cleanly without adding any map chrome.
  */
 @Composable
 private fun LockedNavigationHud(
     heading: String,
     instruction: String,
     distanceLabel: String,
+    maneuver: String? = null,
     isOverSpeedAlert: Boolean = false,
     modifier: Modifier = Modifier
 ) {
@@ -1146,41 +1421,111 @@ private fun LockedNavigationHud(
         offset = Offset(0f, 2f),
         blurRadius = 6f
     )
-    Column(modifier = modifier) {
-        Text(
-            text = heading,
-            style = TextStyle(
-                fontFamily = SpaceGroteskFont,
-                fontWeight = FontWeight.ExtraBold,
-                fontSize = 13.sp,
-                letterSpacing = 1.sp,
-                color = LockedHudBlueText,
-                shadow = hudShadow
+    val maneuverIcon = resolveManeuverIcon(maneuver)
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.Top
+    ) {
+        if (maneuverIcon != null) {
+            Box(
+                modifier = Modifier
+                    .padding(top = 4.dp, end = 8.dp)
+                    .size(30.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                // Soft white shadow layer matching the Owner-Locked HUD typography shadow
+                Icon(
+                    imageVector = maneuverIcon,
+                    contentDescription = null,
+                    tint = LockedHudWhiteShadow,
+                    modifier = Modifier
+                        .size(30.dp)
+                        .padding(top = 2.dp)
+                )
+                Icon(
+                    imageVector = maneuverIcon,
+                    contentDescription = maneuver ?: "Next maneuver",
+                    tint = LockedHudBlueText,
+                    modifier = Modifier.size(28.dp)
+                )
+            }
+        }
+        Column(modifier = Modifier.weight(1f, fill = false)) {
+            Text(
+                text = heading,
+                style = TextStyle(
+                    fontFamily = SpaceGroteskFont,
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = 13.sp,
+                    letterSpacing = 1.sp,
+                    color = LockedHudBlueText,
+                    shadow = hudShadow
+                )
             )
-        )
-        Text(
-            text = instruction,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-            style = TextStyle(
-                fontFamily = SpaceGroteskFont,
-                fontWeight = FontWeight.Bold,
-                fontSize = 20.sp,
-                color = LockedHudBlueText,
-                shadow = hudShadow
+            Text(
+                text = instruction,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                style = TextStyle(
+                    fontFamily = SpaceGroteskFont,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 20.sp,
+                    color = LockedHudBlueText,
+                    shadow = hudShadow
+                )
             )
-        )
-        Text(
-            text = distanceLabel,
-            style = TextStyle(
-                fontFamily = SpaceGroteskFont,
-                fontWeight = FontWeight.SemiBold,
-                fontSize = 14.sp,
-                color = if (isOverSpeedAlert) AnyRollerRed else LockedHudBlueText,
-                shadow = hudShadow
+            Text(
+                text = distanceLabel,
+                style = TextStyle(
+                    fontFamily = SpaceGroteskFont,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp,
+                    color = if (isOverSpeedAlert) AnyRollerRed else LockedHudBlueText,
+                    shadow = hudShadow
+                )
             )
-        )
+        }
     }
+}
+
+private fun resolveManeuverIcon(maneuver: String?): androidx.compose.ui.graphics.vector.ImageVector? {
+    return when (maneuver?.lowercase()?.trim()) {
+        "turn-left" -> Icons.Rounded.TurnLeft
+        "turn-right" -> Icons.Rounded.TurnRight
+        "turn-slight-left", "keep-left", "ramp-left" -> Icons.Rounded.TurnSlightLeft
+        "turn-slight-right", "keep-right", "ramp-right" -> Icons.Rounded.TurnSlightRight
+        "turn-sharp-left" -> Icons.Rounded.TurnSharpLeft
+        "turn-sharp-right" -> Icons.Rounded.TurnSharpRight
+        "roundabout-left" -> Icons.Rounded.RoundaboutLeft
+        "roundabout-right" -> Icons.Rounded.RoundaboutRight
+        "uturn-left" -> Icons.Rounded.UTurnLeft
+        "uturn-right" -> Icons.Rounded.UTurnRight
+        "fork-left" -> Icons.Rounded.ForkLeft
+        "fork-right" -> Icons.Rounded.ForkRight
+        "merge" -> Icons.Rounded.Merge
+        "straight" -> Icons.Rounded.Straight
+        null, "" -> null
+        else -> Icons.Rounded.Straight
+    }
+}
+
+private fun formatUkRoadDistance(meters: Int): String {
+    return when {
+        meters >= 805 -> "%.1f mi".format(meters / 1609.344)
+        meters >= 46 -> {
+            val yards = (meters * 1.09361).toInt()
+            "${((yards + 25) / 50) * 50} yd"
+        }
+        else -> "${(meters * 1.09361).toInt().coerceAtLeast(10)} yd"
+    }
+}
+
+private fun projectLatLngAhead(lat: Double, lng: Double, bearingDeg: Float, distanceMeters: Double): LatLng {
+    val rad = Math.toRadians(bearingDeg.toDouble())
+    val dLat = (distanceMeters * kotlin.math.cos(rad)) / 110_540.0
+    val cosLat = kotlin.math.cos(Math.toRadians(lat)).coerceAtLeast(0.01)
+    val dLng = (distanceMeters * kotlin.math.sin(rad)) / (111_320.0 * cosLat)
+    return LatLng(lat + dLat, lng + dLng)
 }
 
 @Composable

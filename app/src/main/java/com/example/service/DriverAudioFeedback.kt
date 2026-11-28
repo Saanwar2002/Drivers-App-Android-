@@ -1,9 +1,13 @@
 package com.example.service
 
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.ToneGenerator
+import android.os.Build
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -14,15 +18,72 @@ import java.util.Locale
 class DriverAudioFeedback(context: Context) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val audioManager = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    private var focusRequest: AudioFocusRequest? = null
     private var tts: TextToSpeech? = null
     @Volatile
     private var ttsReady = false
 
     init {
+        val navAttrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                .setAudioAttributes(navAttrs)
+                .setAcceptsDelayedFocusGain(false)
+                .setOnAudioFocusChangeListener { /* transient ducking */ }
+                .build()
+        }
+
         tts = TextToSpeech(context.applicationContext) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 tts?.language = Locale.UK
+                tts?.setAudioAttributes(navAttrs)
+                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) = Unit
+                    override fun onDone(utteranceId: String?) {
+                        abandonNavAudioFocus()
+                    }
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) {
+                        abandonNavAudioFocus()
+                    }
+                    override fun onError(utteranceId: String?, errorCode: Int) {
+                        abandonNavAudioFocus()
+                    }
+                })
                 ttsReady = true
+            }
+        }
+    }
+
+    private fun requestNavAudioFocus() {
+        runCatching {
+            val am = audioManager ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                focusRequest?.let { am.requestAudioFocus(it) }
+            } else {
+                @Suppress("DEPRECATION")
+                am.requestAudioFocus(
+                    null,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                )
+            }
+        }
+    }
+
+    private fun abandonNavAudioFocus() {
+        runCatching {
+            val am = audioManager ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                focusRequest?.let { am.abandonAudioFocusRequest(it) }
+            } else {
+                @Suppress("DEPRECATION")
+                am.abandonAudioFocus(null)
             }
         }
     }
@@ -124,11 +185,13 @@ class DriverAudioFeedback(context: Context) {
     }
 
     /**
-     * Speaks concise UK English heads-up driving announcements unless `muteHeadsUp` is enabled.
+     * Speaks concise UK English heads-up driving announcements with transient audio ducking
+     * so background music/radio volume dips smoothly during voice prompts.
      */
     fun speakHeadsUp(text: String, muteHeadsUp: Boolean) {
         if (muteHeadsUp || !ttsReady || text.isBlank()) return
         runCatching {
+            requestNavAudioFocus()
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "anyroller_hud_${System.currentTimeMillis()}")
         }
     }
@@ -158,11 +221,13 @@ class DriverAudioFeedback(context: Context) {
             else -> return
         }
         runCatching {
+            requestNavAudioFocus()
             tts?.speak(spoken, TextToSpeech.QUEUE_ADD, null, "anyroller_chat_${System.currentTimeMillis()}")
         }
     }
 
     fun release() {
+        abandonNavAudioFocus()
         runCatching {
             tts?.stop()
             tts?.shutdown()

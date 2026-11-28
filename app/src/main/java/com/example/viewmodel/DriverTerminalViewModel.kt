@@ -47,10 +47,12 @@ import com.example.data.repository.CockpitLocalSettings
 import com.example.data.repository.DirectionsRepository
 import com.example.data.repository.DriverFirestoreRepository
 import com.example.data.repository.DriverPreferencesStore
+import com.example.service.AnyRollerMessagingService
 import com.example.service.DriverAudioFeedback
 import com.example.service.DriverLocationService
 import com.example.service.DriverLocationSnapshot
 import com.example.service.ExternalIntentHelpers
+import com.example.service.FloatingRideOverlayController
 import com.example.service.GeocoderHelper
 import com.example.service.NetworkMonitor
 import com.example.service.OfferIntelligenceHelper
@@ -167,8 +169,13 @@ data class DriverTerminalUiState(
     val analyticsInsight: String? = null,
     val analyticsTips: List<String> = emptyList(),
     val activeRoute: ActiveRouteResult = ActiveRouteResult(),
+    val remainingRoutePoints: List<com.google.android.gms.maps.model.LatLng> = emptyList(),
+    val liveRemainingDistanceMeters: Int? = null,
+    val liveRemainingEtaMinutes: Int? = null,
+    val snappedRouteBearing: Float? = null,
     val isAutoNavHeadUp: Boolean = true,
     val isAutoNavPaused: Boolean = false,
+    val autoNavPausedAtMs: Long? = null,
     val routeRecalcLimitReached: Boolean = false,
     val currentNavStepIndex: Int = 0,
     val currentStepDistanceMeters: Int? = null,
@@ -310,6 +317,11 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
     private val directionsRepo = DirectionsRepository()
     private val audioFeedback = DriverAudioFeedback(context)
     private val networkMonitor = NetworkMonitor(context)
+    private val floatingOverlay = FloatingRideOverlayController(
+        context = context,
+        onAcceptOffer = { isStacked -> acceptOffer(isStacked = isStacked) },
+        onDeclineOffer = { isStacked -> declineOffer(isStacked = isStacked) }
+    )
 
     private val _uiState = MutableStateFlow(DriverTerminalUiState())
     val uiState: StateFlow<DriverTerminalUiState> = _uiState.asStateFlow()
@@ -333,12 +345,16 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
     private var consecutiveMissedOffers: Int = 0
     private var lastTrackedActiveRide: RideRequest? = null
     private var lastActiveRideId: String? = null
+    private var lastQueuedStackedRideId: String? = null
+    private var lastAlertedCancelledQueuedId: String? = null
     private var declinedOfferIds: Set<String> = emptySet()
     private var lastAlertedOfferId: String? = null
     private var lastRouteLegKey: String? = null
     private var routeRecalcCount: Int = 0
     private var lastRouteFetchLat: Double = 0.0
     private var lastRouteFetchLng: Double = 0.0
+    private var lastRecalcTimestampMs: Long = 0L
+    private var consecutiveOffRouteFixes: Int = 0
     private var lastEtaSyncMs: Long = 0L
     private var incomingChatPopupJob: Job? = null
     private var lastSpokenStepIndex: Int = -1
@@ -365,6 +381,21 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         viewModelScope.launch {
             prefsStore.cockpitSettingsFlow.collect { settings ->
                 _uiState.update { it.copy(cockpitSettings = settings) }
+            }
+        }
+        viewModelScope.launch {
+            combine(
+                _uiState,
+                UrgentPushEventBus.isFullScreenVisible,
+                UrgentPushEventBus.isSplitScreenMode
+            ) { state, fullScreen, splitScreen ->
+                Triple(state, fullScreen, splitScreen)
+            }.collect { (state, fullScreen, splitScreen) ->
+                floatingOverlay.syncState(
+                    state = state,
+                    isFullScreenVisible = fullScreen,
+                    isSplitScreen = splitScreen
+                )
             }
         }
     }
@@ -571,20 +602,33 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                         }
                     }
                     is UrgentPushEvent.RideCancelled -> {
+                        AnyRollerMessagingService.cancelOfferNotification(context, event.rideId)
+                        val before = _uiState.value
+                        val isQueuedStackedCancelled = before.queuedStackedRide?.id == event.rideId ||
+                            lastQueuedStackedRideId == event.rideId
+                        if (isQueuedStackedCancelled && lastAlertedCancelledQueuedId != event.rideId) {
+                            notifyQueuedStackedRideCancelled(event.rideId, 0.0)
+                        }
                         _uiState.update { state ->
                             val isActiveCancelled = state.activeRide?.id == event.rideId
                             val isOfferCancelled = state.incomingOffer?.id == event.rideId
                             val isStackedCancelled = state.stackedRideOffer?.id == event.rideId
                             state.copy(
                                 activeRide = if (isActiveCancelled) null else state.activeRide,
+                                queuedStackedRide = if (isQueuedStackedCancelled) null else state.queuedStackedRide,
                                 incomingOffer = if (isOfferCancelled) null else state.incomingOffer,
                                 stackedRideOffer = if (isStackedCancelled) null else state.stackedRideOffer,
                                 rideState = if (isActiveCancelled || isOfferCancelled) TerminalRideState.IDLE else state.rideState,
-                                toastMessage = if (isActiveCancelled) "Ride was cancelled by the passenger." else state.toastMessage
+                                toastMessage = when {
+                                    isActiveCancelled -> "Ride was cancelled by the passenger."
+                                    isQueuedStackedCancelled -> "Your queued next ride was cancelled by the passenger."
+                                    else -> state.toastMessage
+                                }
                             )
                         }
                     }
                     is UrgentPushEvent.RideAcceptedElsewhere -> {
+                        AnyRollerMessagingService.cancelOfferNotification(context, event.rideId)
                         _uiState.update { state ->
                             val clearedOffer = if (state.incomingOffer?.id == event.rideId) null else state.incomingOffer
                             val clearedStacked = if (state.stackedRideOffer?.id == event.rideId) null else state.stackedRideOffer
@@ -748,32 +792,130 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
             }
         }
 
-        // 6. In-App Turn-by-Turn Voice Guidance & Live Step Progression (mirrors DriverTerminal.tsx)
-        evaluateTurnByTurnNavigation(loc, state, ride)
+        // 6. Live Route Projection (zero-cost polyline trimming, live remaining distance/ETA, route-snapped bearing)
+        // & True Segment Off-Route Check (GPS accuracy filter + 2 consecutive fixes + 12s cooldown + 3/3 hard cap)
+        val isDrivingLeg = state.rideState == TerminalRideState.EN_ROUTE_PICKUP ||
+            state.rideState == TerminalRideState.IN_PROGRESS
+        if (isDrivingLeg && state.activeRoute.points.size >= 2) {
+            val proj = projectOntoPolyline(loc.lat, loc.lng, state.activeRoute.points)
+            val trimmed = buildList(state.activeRoute.points.size - proj.segmentIndex) {
+                add(proj.projectedPoint)
+                for (i in (proj.segmentIndex + 1) until state.activeRoute.points.size) {
+                    add(state.activeRoute.points[i])
+                }
+            }
+            val totalRouteMeters = state.activeRoute.totalDistanceMeters.coerceAtLeast(1)
+            val ratio = (proj.remainingDistanceMeters.toDouble() / totalRouteMeters.toDouble()).coerceIn(0.0, 1.2)
+            val baselineDurSec = state.activeRoute.totalDurationSeconds.takeIf { it > 0 }
+                ?: ((state.activeRoute.etaMinutes ?: 1) * 60)
+            val scaledSec = (baselineDurSec * ratio).toInt()
+            val liveEtaMins = if (loc.speedMps >= 3.0f && proj.remainingDistanceMeters > 200) {
+                val speedEtaSec = ((proj.remainingDistanceMeters * 1.15f) / loc.speedMps.coerceIn(5.0f, 30.0f)).toInt()
+                (((scaledSec * 0.65) + (speedEtaSec * 0.35)) / 60.0).toInt().coerceAtLeast(1)
+            } else {
+                (scaledSec / 60).coerceAtLeast(1)
+            }
+            val snappedBearing = if (proj.distanceMeters <= 28f) proj.segmentBearing else null
+            _uiState.update {
+                it.copy(
+                    remainingRoutePoints = trimmed,
+                    liveRemainingDistanceMeters = proj.remainingDistanceMeters,
+                    liveRemainingEtaMinutes = liveEtaMins,
+                    snappedRouteBearing = snappedBearing
+                )
+            }
 
-        // 7. Off-route check for cost-capped Directions recalculation (max 3 per leg)
-        if ((state.rideState == TerminalRideState.EN_ROUTE_PICKUP || state.rideState == TerminalRideState.IN_PROGRESS) &&
-            state.activeRoute.points.size >= 2
-        ) {
-            val distFromRoute = minDistanceToPolylineMeters(loc.lat, loc.lng, state.activeRoute.points)
-            if (distFromRoute > 70f) {
-                refreshActiveRouteIfNeeded(ride, state.rideState)
+            // Off-route check: ignore noisy GPS fixes (>35m accuracy), require 2 consecutive off-route fixes & 12s cooldown
+            val hasReliableAccuracy = loc.accuracyMeters <= 0f || loc.accuracyMeters <= 35f
+            if (hasReliableAccuracy) {
+                if (proj.distanceMeters > 70f) {
+                    consecutiveOffRouteFixes++
+                    val nowRecalcMs = System.currentTimeMillis()
+                    if (consecutiveOffRouteFixes >= 2 && (nowRecalcMs - lastRecalcTimestampMs) >= 12_000L) {
+                        consecutiveOffRouteFixes = 0
+                        lastRecalcTimestampMs = nowRecalcMs
+                        refreshActiveRouteIfNeeded(ride, state.rideState)
+                    }
+                } else if (proj.distanceMeters <= 50f) {
+                    consecutiveOffRouteFixes = 0
+                }
             }
         }
+
+        // 7. In-App Turn-by-Turn Voice Guidance & Live Step Progression (UK yards/miles)
+        evaluateTurnByTurnNavigation(loc, _uiState.value, ride)
     }
 
-    private fun minDistanceToPolylineMeters(
+    private data class PolylineProjection(
+        val distanceMeters: Float,
+        val segmentIndex: Int,
+        val projectedPoint: com.google.android.gms.maps.model.LatLng,
+        val segmentBearing: Float,
+        val remainingDistanceMeters: Int
+    )
+
+    private fun projectOntoPolyline(
         lat: Double,
         lng: Double,
         points: List<com.google.android.gms.maps.model.LatLng>
-    ): Float {
-        if (points.isEmpty()) return Float.MAX_VALUE
-        var best = Float.MAX_VALUE
-        for (pt in points) {
-            val d = distanceMeters(lat, lng, pt.latitude, pt.longitude)
-            if (d < best) best = d
+    ): PolylineProjection {
+        val cosLat = kotlin.math.cos(Math.toRadians(lat)).coerceAtLeast(0.01)
+        val metersPerDegLat = 110_540.0
+        val metersPerDegLng = 111_320.0 * cosLat
+
+        var bestDist = Float.MAX_VALUE
+        var bestSegIdx = 0
+        var bestProjPt = points.first()
+        var bestBearing = 0f
+
+        for (i in 0 until points.lastIndex) {
+            val a = points[i]
+            val b = points[i + 1]
+            val ax = (a.longitude - lng) * metersPerDegLng
+            val ay = (a.latitude - lat) * metersPerDegLat
+            val bx = (b.longitude - lng) * metersPerDegLng
+            val by = (b.latitude - lat) * metersPerDegLat
+            val dx = bx - ax
+            val dy = by - ay
+            val lenSq = dx * dx + dy * dy
+            val t = if (lenSq > 1e-6) {
+                ((-(ax * dx + ay * dy)) / lenSq).coerceIn(0.0, 1.0)
+            } else 0.0
+            val px = ax + t * dx
+            val py = ay + t * dy
+            val dist = kotlin.math.hypot(px, py).toFloat()
+            if (dist < bestDist) {
+                bestDist = dist
+                bestSegIdx = i
+                bestProjPt = com.google.android.gms.maps.model.LatLng(
+                    a.latitude + t * (b.latitude - a.latitude),
+                    a.longitude + t * (b.longitude - a.longitude)
+                )
+                bestBearing = if (lenSq > 1e-6) {
+                    ((Math.toDegrees(kotlin.math.atan2(dx, dy)) + 360.0) % 360.0).toFloat()
+                } else bestBearing
+            }
         }
-        return best
+
+        // Compute exact remaining distance along polyline from projectedPoint -> end
+        var remMeters = distanceMeters(
+            bestProjPt.latitude, bestProjPt.longitude,
+            points[bestSegIdx + 1].latitude, points[bestSegIdx + 1].longitude
+        ).toDouble()
+        for (i in (bestSegIdx + 1) until points.lastIndex) {
+            remMeters += distanceMeters(
+                points[i].latitude, points[i].longitude,
+                points[i + 1].latitude, points[i + 1].longitude
+            ).toDouble()
+        }
+
+        return PolylineProjection(
+            distanceMeters = bestDist,
+            segmentIndex = bestSegIdx,
+            projectedPoint = bestProjPt,
+            segmentBearing = bestBearing,
+            remainingDistanceMeters = remMeters.toInt().coerceAtLeast(0)
+        )
     }
 
     private fun buildChainedStepInstruction(
@@ -874,21 +1016,21 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
             }
         }
 
-        // Prep announcements for the upcoming maneuver at 1000m, 400m, and 100m
+        // Prep announcements for the upcoming maneuver in natural UK road units (half mile, 400 yards, 100 yards)
         val nextIdx = stepIdx + 1
         if (nextIdx < steps.size && distToEnd < Float.MAX_VALUE) {
             val nextPhrase = buildChainedStepInstruction(steps, nextIdx)
             val currentStepLen = steps[stepIdx].distanceMeters
             if (nextPhrase.isNotBlank()) {
                 when {
-                    distToEnd <= 110f && spokenStepThresholds.add("$nextIdx:100") -> {
-                        audioFeedback.speakHeadsUp("In 100 meters, $nextPhrase", muteHeadsUp = false)
+                    distToEnd <= 105f && spokenStepThresholds.add("$nextIdx:100yd") -> {
+                        audioFeedback.speakHeadsUp("In 100 yards, $nextPhrase", muteHeadsUp = false)
                     }
-                    distToEnd in 160f..420f && currentStepLen >= 450 && spokenStepThresholds.add("$nextIdx:400") -> {
-                        audioFeedback.speakHeadsUp("In 400 meters, $nextPhrase", muteHeadsUp = false)
+                    distToEnd in 160f..400f && currentStepLen >= 420 && spokenStepThresholds.add("$nextIdx:400yd") -> {
+                        audioFeedback.speakHeadsUp("In 400 yards, $nextPhrase", muteHeadsUp = false)
                     }
-                    distToEnd in 550f..1050f && currentStepLen >= 1100 && spokenStepThresholds.add("$nextIdx:1000") -> {
-                        audioFeedback.speakHeadsUp("In 1 kilometer, $nextPhrase", muteHeadsUp = false)
+                    distToEnd in 500f..860f && currentStepLen >= 950 && spokenStepThresholds.add("$nextIdx:halfmi") -> {
+                        audioFeedback.speakHeadsUp("In half a mile, $nextPhrase", muteHeadsUp = false)
                     }
                 }
             }
@@ -939,6 +1081,7 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                         val secs = ((state.incomingOffer.expiresAtMs - now) / 1000L).toInt()
                         if (secs <= 0) {
                             expiredOfferId = state.incomingOffer.id
+                            AnyRollerMessagingService.cancelOfferNotification(context, state.incomingOffer.id)
                             triggerMissedOfferTimeout = true
                             next = next.copy(incomingOffer = null, rideState = TerminalRideState.IDLE, offerSecondsLeft = 0)
                         } else {
@@ -948,6 +1091,7 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                     if (state.stackedRideOffer != null) {
                         val secs = ((state.stackedRideOffer.expiresAtMs - now) / 1000L).toInt()
                         next = if (secs <= 0) {
+                            AnyRollerMessagingService.cancelOfferNotification(context, state.stackedRideOffer.id)
                             next.copy(stackedRideOffer = null, stackedOfferSecondsLeft = 0)
                         } else {
                             next.copy(stackedOfferSecondsLeft = secs)
@@ -969,6 +1113,11 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                     }
                     if (state.quickMessageCooldownSeconds > 0) {
                         next = next.copy(quickMessageCooldownSeconds = (state.quickMessageCooldownSeconds - 1).coerceAtLeast(0))
+                    }
+                    // Auto-resume 3D Head-Up follow 15 seconds after manual map drag so driver stays hands-free
+                    val pausedAt = state.autoNavPausedAtMs
+                    if (state.isAutoNavPaused && pausedAt != null && (now - pausedAt) >= 15_000L) {
+                        next = next.copy(isAutoNavPaused = false, autoNavPausedAtMs = null)
                     }
                     // Check 30s stationary auto-arrival within 200m of pickup
                     val proxStart = pickupProximityStartMs
@@ -1141,17 +1290,38 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
             }
         }
 
+        // Detect passenger cancellation of an ALREADY ACCEPTED stacked (queued) ride without interrupting Ride A
+        var stackedCancelNotice: String? = null
+        val prevQueuedId = lastQueuedStackedRideId
+        if (prevQueuedId != null && prevQueuedId != currentActive?.id && queuedStacked?.id != prevQueuedId) {
+            val updatedQueued = driverRides.firstOrNull { it.id == prevQueuedId }
+            if (updatedQueued != null &&
+                updatedQueued.status.lowercase() == "cancelled" &&
+                lastAlertedCancelledQueuedId != prevQueuedId
+            ) {
+                stackedCancelNotice = notifyQueuedStackedRideCancelled(
+                    rideId = updatedQueued.id,
+                    cancellationFee = updatedQueued.cancellationFee
+                )
+            }
+        }
+        lastQueuedStackedRideId = queuedStacked?.id
+
         // Detect mid-trip passenger modifications (extra stops, new destination, fare/tip change)
-        var midTripNotice: String? = currentState.lastRideUpdateNotice
+        var midTripNotice: String? = stackedCancelNotice ?: currentState.lastRideUpdateNotice
+        var midTripRouteChanged = false
         if (currentActive != null && lastTrackedActiveRide != null && lastTrackedActiveRide!!.id == currentActive.id) {
             val prev = lastTrackedActiveRide!!
             val stopsChanged = prev.stops != currentActive.stops
             val dropoffChanged = prev.dropoffAddress != currentActive.dropoffAddress ||
                 prev.dropoffLat != currentActive.dropoffLat ||
                 prev.dropoffLng != currentActive.dropoffLng
-            val pickupChanged = prev.pickupAddress != currentActive.pickupAddress
+            val pickupChanged = prev.pickupAddress != currentActive.pickupAddress ||
+                prev.pickupLat != currentActive.pickupLat ||
+                prev.pickupLng != currentActive.pickupLng
             val fareChanged = kotlin.math.abs(prev.fareEstimate - currentActive.fareEstimate) >= 0.05
             val tipChanged = currentActive.tipAmount > prev.tipAmount + 0.01
+            midTripRouteChanged = stopsChanged || dropoffChanged || pickupChanged
 
             if (stopsChanged || dropoffChanged || pickupChanged || fareChanged || currentActive.isModifiedByPassenger) {
                 audioFeedback.playRideUpdatedAlert(currentState.profile.muteRideOfferAlerts)
@@ -1162,8 +1332,13 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 if (stopsChanged) summaryParts += "${currentActive.stops.size} stop(s)"
                 if (dropoffChanged) summaryParts += "new dropoff"
                 if (fareChanged) summaryParts += "fare £%.2f".format(currentActive.fareEstimate)
+                val navSuffix = if (midTripRouteChanged && currentState.cockpitSettings.autoLaunchExternalNav) {
+                    "Updating navigation."
+                } else {
+                    "Restart external nav if open."
+                }
                 val noticeText = if (summaryParts.isNotEmpty()) {
-                    "Passenger updated trip: ${summaryParts.joinToString(" • ")}. Restart external nav if open."
+                    "Passenger updated trip: ${summaryParts.joinToString(" • ")}. $navSuffix"
                 } else {
                     "Passenger updated journey details. Check updated route & fare."
                 }
@@ -1346,16 +1521,32 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
             )
         }
 
-        // Play native chime + haptic + optional UK TTS heads-up when a brand-new offer arrives
+        // Play native chime + haptic + UK TTS heads-up + heads-up banner over external nav when a brand-new offer arrives
         val newlyArrivedOffer = nextIncoming ?: nextStacked
         if (newlyArrivedOffer != null && newlyArrivedOffer.id != lastAlertedOfferId) {
             lastAlertedOfferId = newlyArrivedOffer.id
+            val isStackedOffer = (nextIncoming == null && nextStacked != null)
             audioFeedback.playRideOfferChime(latestState.profile.muteRideOfferAlerts)
             ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 200, 100, 200, 100, 450))
-            audioFeedback.speakHeadsUp(
-                "New ride offer for £%.2f".format(newlyArrivedOffer.fareEstimate),
-                latestState.profile.muteHeadsUpVolume
-            )
+            val spokenOffer = if (isStackedOffer) {
+                "Stacked next ride offer for £%.2f".format(newlyArrivedOffer.fareEstimate)
+            } else {
+                "New ride offer for £%.2f".format(newlyArrivedOffer.fareEstimate)
+            }
+            audioFeedback.speakHeadsUp(spokenOffer, latestState.profile.muteHeadsUpVolume)
+            // Guarantee a high-priority heads-up notification banner when Google Maps/Waze is on-screen (even in PiP)
+            if (!UrgentPushEventBus.isFullScreenVisible.value) {
+                val remMs = (newlyArrivedOffer.expiresAtMs - System.currentTimeMillis()).coerceIn(5_000L, 60_000L)
+                AnyRollerMessagingService.showUrgentOfferNotification(
+                    context = context,
+                    rideId = newlyArrivedOffer.id,
+                    fareEstimate = newlyArrivedOffer.fareEstimate,
+                    pickupAddress = newlyArrivedOffer.pickupAddress,
+                    dropoffAddress = newlyArrivedOffer.dropoffAddress,
+                    isStacked = isStackedOffer,
+                    timeoutMs = remMs
+                )
+            }
         } else if (newlyArrivedOffer == null) {
             lastAlertedOfferId = null
         }
@@ -1392,6 +1583,38 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
             lastCollapsedRideState = derivedRideState
         }
 
+        val midTripExternalNavEvent = if (midTripRouteChanged &&
+            currentActive != null &&
+            latestState.cockpitSettings.autoLaunchExternalNav
+        ) {
+            when (derivedRideState) {
+                TerminalRideState.EN_ROUTE_PICKUP -> {
+                    if (currentActive.pickupLat != 0.0 || currentActive.pickupLng != 0.0) {
+                        ExternalNavLaunchEvent(
+                            id = System.currentTimeMillis(),
+                            lat = currentActive.pickupLat,
+                            lng = currentActive.pickupLng
+                        )
+                    } else null
+                }
+                TerminalRideState.IN_PROGRESS -> {
+                    if (currentActive.dropoffLat != 0.0 || currentActive.dropoffLng != 0.0) {
+                        val remainingWaypoints = currentActive.stops
+                            .drop(currentActive.currentStopIndex.coerceAtLeast(0))
+                            .filter { it.lat != 0.0 || it.lng != 0.0 }
+                            .map { it.lat to it.lng }
+                        ExternalNavLaunchEvent(
+                            id = System.currentTimeMillis(),
+                            lat = currentActive.dropoffLat,
+                            lng = currentActive.dropoffLng,
+                            waypoints = remainingWaypoints
+                        )
+                    } else null
+                }
+                else -> null
+            }
+        } else null
+
         _uiState.update { st ->
             st.copy(
                 activeRide = currentActive,
@@ -1409,6 +1632,7 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 shiftTripsCompleted = shiftCompleted.size,
                 shiftEarnings = computedShiftEarnings,
                 shiftPaidMiles = computedShiftPaidMiles,
+                pendingExternalNav = midTripExternalNavEvent ?: st.pendingExternalNav,
                 toastMessage = if (midTripNotice != null && midTripNotice != st.lastRideUpdateNotice) midTripNotice else st.toastMessage
             )
         }
@@ -1468,34 +1692,49 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         spokenStepThresholds.clear()
         hasAnnouncedLegArrivalKey = null
         routeRecalcCount = 0
+        consecutiveOffRouteFixes = 0
+        lastRecalcTimestampMs = 0L
         lastRouteLegKey = null
         _uiState.update {
             it.copy(
                 incomingChatPopup = null,
+                remainingRoutePoints = emptyList(),
+                liveRemainingDistanceMeters = null,
+                liveRemainingEtaMinutes = null,
+                snappedRouteBearing = null,
                 routeRecalcLimitReached = false,
                 currentNavStepIndex = 0,
                 currentStepDistanceMeters = null,
                 isAutoNavPaused = false,
+                autoNavPausedAtMs = null,
                 isActiveCardCollapsed = true
             )
         }
     }
 
     private fun refreshActiveRouteIfNeeded(ride: RideRequest?, state: TerminalRideState) {
+        // COST-SAVING FIX: Never call Directions API while parked in WAITING state at pickup!
+        if (state == TerminalRideState.WAITING) {
+            return
+        }
         if (ride == null || state !in setOf(
                 TerminalRideState.EN_ROUTE_PICKUP,
-                TerminalRideState.WAITING,
                 TerminalRideState.IN_PROGRESS
             )
         ) {
             lastRouteLegKey = null
             routeRecalcCount = 0
+            consecutiveOffRouteFixes = 0
             lastSpokenStepIndex = -1
             spokenStepThresholds.clear()
             if (_uiState.value.activeRoute.points.isNotEmpty() || _uiState.value.routeRecalcLimitReached) {
                 _uiState.update {
                     it.copy(
                         activeRoute = ActiveRouteResult(),
+                        remainingRoutePoints = emptyList(),
+                        liveRemainingDistanceMeters = null,
+                        liveRemainingEtaMinutes = null,
+                        snappedRouteBearing = null,
                         routeRecalcLimitReached = false,
                         currentNavStepIndex = 0,
                         currentStepDistanceMeters = null
@@ -1505,18 +1744,23 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
             return
         }
 
-        val (destLat, destLng) = if (state == TerminalRideState.IN_PROGRESS) {
-            val stop = ride.stops.getOrNull(ride.currentStopIndex)
-            if (stop != null && (stop.lat != 0.0 || stop.lng != 0.0)) {
-                stop.lat to stop.lng
-            } else {
-                ride.dropoffLat to ride.dropoffLng
-            }
+        // Single-call multi-stop fetch (Basic SKU <=10 non-optimized waypoints) so advancing stops costs £0 extra
+        val (destLat, destLng, waypoints) = if (state == TerminalRideState.IN_PROGRESS) {
+            val remainingStops = ride.stops
+                .drop(ride.currentStopIndex.coerceAtLeast(0))
+                .filter { it.lat != 0.0 || it.lng != 0.0 }
+                .map { it.lat to it.lng }
+            Triple(ride.dropoffLat, ride.dropoffLng, remainingStops)
         } else {
-            ride.pickupLat to ride.pickupLng
+            Triple(ride.pickupLat, ride.pickupLng, emptyList())
         }
 
-        val legKey = "${ride.id}:${state.name}:${ride.currentStopIndex}:$destLat:$destLng"
+        // Key IN_PROGRESS by full stops signature + dropoff (NOT currentStopIndex) so advancing stops reuses the 1-call multi-leg route
+        val stopsSig = if (state == TerminalRideState.IN_PROGRESS) {
+            ride.stops.joinToString("|") { "${it.lat},${it.lng}" }
+        } else ""
+        val legKey = "${ride.id}:${state.name}:$destLat:$destLng:$stopsSig"
+
         val loc = _uiState.value.driverLocation
         val movedMeters = FloatArray(1)
         if (lastRouteFetchLat != 0.0 || lastRouteFetchLng != 0.0) {
@@ -1528,9 +1772,16 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         if (legKey != lastRouteLegKey) {
             lastRouteLegKey = legKey
             routeRecalcCount = 0
+            consecutiveOffRouteFixes = 0
             lastSpokenStepIndex = -1
             spokenStepThresholds.clear()
-            _uiState.update { it.copy(routeRecalcLimitReached = false, currentNavStepIndex = 0, currentStepDistanceMeters = null) }
+            _uiState.update {
+                it.copy(
+                    routeRecalcLimitReached = false,
+                    currentNavStepIndex = 0,
+                    currentStepDistanceMeters = null
+                )
+            }
         } else if (routeRecalcCount >= 3) {
             if (!_uiState.value.routeRecalcLimitReached) {
                 _uiState.update { it.copy(routeRecalcLimitReached = true) }
@@ -1547,13 +1798,23 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
 
         lastRouteFetchLat = loc.lat
         lastRouteFetchLng = loc.lng
+        lastRecalcTimestampMs = System.currentTimeMillis()
         viewModelScope.launch {
-            val route = directionsRepo.fetchRoute(loc.lat, loc.lng, destLat, destLng)
+            val route = directionsRepo.fetchRoute(
+                originLat = loc.lat,
+                originLng = loc.lng,
+                destLat = destLat,
+                destLng = destLng,
+                waypoints = waypoints
+            )
             lastSpokenStepIndex = -1
             spokenStepThresholds.clear()
             _uiState.update {
                 it.copy(
                     activeRoute = route,
+                    remainingRoutePoints = route.points,
+                    liveRemainingDistanceMeters = route.totalDistanceMeters.takeIf { d -> d > 0 },
+                    liveRemainingEtaMinutes = route.etaMinutes,
                     currentNavStepIndex = 0,
                     currentStepDistanceMeters = route.steps.firstOrNull()?.distanceMeters
                 )
@@ -1655,22 +1916,23 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
             st.copy(
                 isAutoNavHeadUp = next,
                 isAutoNavPaused = false,
+                autoNavPausedAtMs = null,
                 toastMessage = if (next) "3D Head-Up Navigation resumed" else "2D Map Overview mode"
             )
         }
     }
 
     fun pauseAutoNavFromGesture() {
-        if (!_uiState.value.isAutoNavPaused) {
-            _uiState.update { it.copy(isAutoNavPaused = true) }
-        }
+        val now = System.currentTimeMillis()
+        _uiState.update { it.copy(isAutoNavPaused = true, autoNavPausedAtMs = now) }
     }
 
     fun resumeAutoNav() {
         _uiState.update {
             it.copy(
                 isAutoNavHeadUp = true,
-                isAutoNavPaused = false
+                isAutoNavPaused = false,
+                autoNavPausedAtMs = null
             )
         }
     }
@@ -1880,12 +2142,50 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
         }
     }
 
+    private fun notifyQueuedStackedRideCancelled(rideId: String, cancellationFee: Double): String {
+        lastAlertedCancelledQueuedId = rideId
+        if (lastQueuedStackedRideId == rideId) {
+            lastQueuedStackedRideId = null
+        }
+        val st = _uiState.value
+        audioFeedback.playCancellationAlert(st.profile.muteRideOfferAlerts)
+        ExternalIntentHelpers.vibratePattern(context, longArrayOf(0, 260, 120, 260))
+        val msg = if (cancellationFee > 0.0) {
+            "Queued next ride cancelled by passenger. £%.2f cancellation fee credited.".format(cancellationFee)
+        } else {
+            "Your queued next ride was cancelled by the passenger. Continue your current trip."
+        }
+        audioFeedback.speakHeadsUp(msg, st.profile.muteHeadsUpVolume)
+        if (!UrgentPushEventBus.isFullScreenVisible.value) {
+            AnyRollerMessagingService.showStackedCancelledNotification(context, rideId, msg)
+        }
+        return msg
+    }
+
+    private fun buildCurrentTripExternalNavEvent(state: DriverTerminalUiState): ExternalNavLaunchEvent? {
+        if (!state.cockpitSettings.autoLaunchExternalNav) return null
+        val active = state.activeRide ?: return null
+        if (state.rideState != TerminalRideState.IN_PROGRESS) return null
+        if (active.dropoffLat == 0.0 && active.dropoffLng == 0.0) return null
+        val remainingWaypoints = active.stops
+            .drop(active.currentStopIndex.coerceAtLeast(0))
+            .filter { it.lat != 0.0 || it.lng != 0.0 }
+            .map { it.lat to it.lng }
+        return ExternalNavLaunchEvent(
+            id = System.currentTimeMillis(),
+            lat = active.dropoffLat,
+            lng = active.dropoffLng,
+            waypoints = remainingWaypoints
+        )
+    }
+
     // --- Server-Authoritative Ride Lifecycle ---
 
     fun acceptOffer(isStacked: Boolean = false) {
         val state = _uiState.value
         val offer = if (isStacked) state.stackedRideOffer else state.incomingOffer
         if (offer == null) return
+        AnyRollerMessagingService.cancelOfferNotification(context, offer.id)
         val uid = state.uid
         consecutiveMissedOffers = 0
         viewModelScope.launch {
@@ -1896,8 +2196,10 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                     if (isStacked && uid.isNotBlank()) {
                         repository.syncActiveRideDropoff(uid, offer.dropoffLat, offer.dropoffLng)
                     }
-                    val autoNavEvent = if (!isStacked &&
-                        _uiState.value.cockpitSettings.autoLaunchExternalNav &&
+                    val autoNavEvent = if (isStacked) {
+                        // Return driver seamlessly back to Google Maps / Waze for their current active trip
+                        buildCurrentTripExternalNavEvent(_uiState.value)
+                    } else if (_uiState.value.cockpitSettings.autoLaunchExternalNav &&
                         (offer.pickupLat != 0.0 || offer.pickupLng != 0.0)
                     ) {
                         ExternalNavLaunchEvent(
@@ -1951,8 +2253,9 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                                     )
                                 }
                             }
-                            val autoNavEvent = if (!isStacked &&
-                                _uiState.value.cockpitSettings.autoLaunchExternalNav &&
+                            val autoNavEvent = if (isStacked) {
+                                buildCurrentTripExternalNavEvent(_uiState.value)
+                            } else if (_uiState.value.cockpitSettings.autoLaunchExternalNav &&
                                 (offer.pickupLat != 0.0 || offer.pickupLng != 0.0)
                             ) {
                                 ExternalNavLaunchEvent(
@@ -1989,10 +2292,12 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
     }
 
     fun declineOffer(isStacked: Boolean = false) {
-        val offer = if (isStacked) _uiState.value.stackedRideOffer else _uiState.value.incomingOffer
+        val currentState = _uiState.value
+        val offer = if (isStacked) currentState.stackedRideOffer else currentState.incomingOffer
         if (offer == null) return
+        AnyRollerMessagingService.cancelOfferNotification(context, offer.id)
         consecutiveMissedOffers = 0
-        val uid = _uiState.value.uid
+        val uid = currentState.uid
         viewModelScope.launch(Dispatchers.IO) {
             prefsStore.addDeclinedOfferId(offer.id)
             // Call server-authoritative POST /api/rides/decline for instant re-dispatch; fall back safely if unavailable
@@ -2003,9 +2308,14 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                 repository.recordDriverDeclineStatus(uid)
             }
         }
+        val returnNavEvent = if (isStacked) buildCurrentTripExternalNavEvent(currentState) else null
         _uiState.update {
             if (isStacked) {
-                it.copy(stackedRideOffer = null, toastMessage = "Queued ride declined.")
+                it.copy(
+                    stackedRideOffer = null,
+                    pendingExternalNav = returnNavEvent ?: it.pendingExternalNav,
+                    toastMessage = "Queued ride declined."
+                )
             } else {
                 it.copy(incomingOffer = null, rideState = TerminalRideState.IDLE, toastMessage = "Ride offer declined.")
             }
@@ -2312,6 +2622,30 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                             )
                         }
                     }
+                    val remainingWaypoints = ride.stops
+                        .drop(nextIndex.coerceAtLeast(0))
+                        .filter { it.lat != 0.0 || it.lng != 0.0 }
+                        .map { it.lat to it.lng }
+                    val autoNavEvent = if (_uiState.value.cockpitSettings.autoLaunchExternalNav &&
+                        (ride.dropoffLat != 0.0 || ride.dropoffLng != 0.0)
+                    ) {
+                        ExternalNavLaunchEvent(
+                            id = System.currentTimeMillis(),
+                            lat = ride.dropoffLat,
+                            lng = ride.dropoffLng,
+                            waypoints = remainingWaypoints
+                        )
+                    } else null
+                    // Advance local step pointer into the next leg of our single-call multi-stop route (0 extra API calls!)
+                    val nextLegFirstStep = _uiState.value.activeRoute.steps.indexOfFirst { it.legIndex >= nextIndex }
+                    if (nextLegFirstStep >= 0) {
+                        lastSpokenStepIndex = nextLegFirstStep
+                        spokenStepThresholds.clear()
+                        val nextLegSpeech = buildChainedStepInstruction(_uiState.value.activeRoute.steps, nextLegFirstStep)
+                        if (nextLegSpeech.isNotBlank() && _uiState.value.isAutoNavHeadUp) {
+                            audioFeedback.speakHeadsUp(nextLegSpeech, _uiState.value.profile.muteHeadsUpVolume)
+                        }
+                    }
                     _uiState.update {
                         it.copy(
                             isBusy = false,
@@ -2319,7 +2653,16 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                             accumulatedPaidWaitSeconds = it.accumulatedPaidWaitSeconds + addedStopWait,
                             currentStopWaitSeconds = 0,
                             showLeaveStopReminder = false,
-                            toastMessage = "Stop completed — heading to next point."
+                            currentNavStepIndex = if (nextLegFirstStep >= 0) nextLegFirstStep else it.currentNavStepIndex,
+                            currentStepDistanceMeters = if (nextLegFirstStep >= 0) {
+                                it.activeRoute.steps.getOrNull(nextLegFirstStep)?.distanceMeters
+                            } else it.currentStepDistanceMeters,
+                            pendingExternalNav = autoNavEvent ?: it.pendingExternalNav,
+                            toastMessage = if (remainingWaypoints.isEmpty()) {
+                                "Stop completed — heading to final destination."
+                            } else {
+                                "Stop completed — heading to next stop."
+                            }
                         )
                     }
                 }
@@ -2663,6 +3006,16 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                     isStackingEnabled = state.profile.stackingEnabled
                 )
             }
+            val stackedNavEvent = if (nextQueued != null &&
+                _uiState.value.cockpitSettings.autoLaunchExternalNav &&
+                (nextQueued.pickupLat != 0.0 || nextQueued.pickupLng != 0.0)
+            ) {
+                ExternalNavLaunchEvent(
+                    id = System.currentTimeMillis(),
+                    lat = nextQueued.pickupLat,
+                    lng = nextQueued.pickupLng
+                )
+            } else null
             _uiState.update {
                 it.copy(
                     isBusy = false,
@@ -2671,6 +3024,7 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
                     activeRide = nextQueued,
                     queuedStackedRide = null,
                     rideState = if (nextQueued != null) TerminalRideState.EN_ROUTE_PICKUP else TerminalRideState.IDLE,
+                    pendingExternalNav = stackedNavEvent ?: it.pendingExternalNav,
                     toastMessage = if (nextQueued != null) {
                         "Starting your next queued trip!"
                     } else {
@@ -3376,6 +3730,7 @@ class DriverTerminalViewModel(application: Application) : AndroidViewModel(appli
 
     override fun onCleared() {
         unbindAll()
+        floatingOverlay.destroy()
         audioFeedback.release()
         super.onCleared()
     }

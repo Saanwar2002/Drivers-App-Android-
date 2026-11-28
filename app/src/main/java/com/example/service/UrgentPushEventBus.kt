@@ -23,6 +23,7 @@ data class DriverLocationSnapshot(
     val lng: Double = -0.1278,
     val heading: Float = 0f,
     val speedMps: Float = 0f,
+    val accuracyMeters: Float = 0f,
     val hasRealFix: Boolean = false
 )
 
@@ -36,6 +37,12 @@ object UrgentPushEventBus {
     private val _isLocationServiceRunning = MutableStateFlow(false)
     val isLocationServiceRunning: StateFlow<Boolean> = _isLocationServiceRunning.asStateFlow()
 
+    private val _isFullScreenVisible = MutableStateFlow(false)
+    val isFullScreenVisible: StateFlow<Boolean> = _isFullScreenVisible.asStateFlow()
+
+    private val _isSplitScreenMode = MutableStateFlow(false)
+    val isSplitScreenMode: StateFlow<Boolean> = _isSplitScreenMode.asStateFlow()
+
     fun emit(event: UrgentPushEvent) {
         _events.tryEmit(event)
     }
@@ -46,5 +53,13 @@ object UrgentPushEventBus {
 
     fun setLocationServiceRunning(running: Boolean) {
         _isLocationServiceRunning.value = running
+    }
+
+    fun setFullScreenVisible(visible: Boolean) {
+        _isFullScreenVisible.value = visible
+    }
+
+    fun setSplitScreenMode(inSplitScreen: Boolean) {
+        _isSplitScreenMode.value = inSplitScreen
     }
 }

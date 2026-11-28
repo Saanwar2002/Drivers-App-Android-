@@ -89,6 +89,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.example.service.ExternalIntentHelpers
+import com.example.service.FloatingRideOverlayController
+import com.example.service.UrgentPushEventBus
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.ui.theme.AnyRollerBgInput
 import com.example.ui.theme.AnyRollerBgPrimary
 import com.example.ui.theme.AnyRollerBgSecondary
@@ -675,7 +678,7 @@ fun DriverMenuScreen(
                 // Auto-Launch External Navigation (ON by default, toggleable OFF)
                 MenuSwitchRow(
                     title = "Auto-Launch External Navigation",
-                    subtitle = "Automatically open ${profile.defaultNavApp} on Accept Ride & Start Trip (saves 2 taps)",
+                    subtitle = "Auto-opens ${profile.defaultNavApp} on Accept, Start Trip, Multi-Stops, route updates & queued rides",
                     checked = cockpit.autoLaunchExternalNav,
                     testTag = "switch_auto_launch_external_nav",
                     onCheckedChange = { enabled ->
@@ -718,9 +721,50 @@ fun DriverMenuScreen(
 
                 HorizontalDivider(color = AnyRollerBorder)
 
+                // Opt-In Floating Ride Info Overlay Card (Primary companion over Google Maps / Waze)
+                val fullScreenTick by UrgentPushEventBus.isFullScreenVisible.collectAsStateWithLifecycle()
+                val hasOverlayPermission = remember(fullScreenTick, cockpit.floatingOverlayEnabled) {
+                    FloatingRideOverlayController.canDrawOverlays(context)
+                }
                 MenuSwitchRow(
-                    title = "Picture-in-Picture Mini Window",
-                    subtitle = "Keep live trip status & speed visible while using Google Maps or Waze",
+                    title = "Floating Ride Info Overlay",
+                    subtitle = when {
+                        cockpit.floatingOverlayEnabled && hasOverlayPermission ->
+                            "Active — draggable Ride Info Card floats over Google Maps & Waze"
+                        cockpit.floatingOverlayEnabled ->
+                            "Permission needed — allow 'Display over other apps' in Android Settings"
+                        else ->
+                            "Float a readable, draggable Ride Info Card over Google Maps or Waze"
+                    },
+                    checked = cockpit.floatingOverlayEnabled,
+                    testTag = "switch_floating_overlay",
+                    onCheckedChange = { enabled ->
+                        viewModel.updateCockpitSettings { it.copy(floatingOverlayEnabled = enabled) }
+                        if (enabled && !FloatingRideOverlayController.canDrawOverlays(context)) {
+                            FloatingRideOverlayController.openOverlayPermissionSettings(context)
+                        }
+                    }
+                )
+                if (cockpit.floatingOverlayEnabled && !hasOverlayPermission) {
+                    OutlinedButton(
+                        onClick = { FloatingRideOverlayController.openOverlayPermissionSettings(context) },
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(44.dp)
+                            .testTag("grant_overlay_permission_button")
+                    ) {
+                        Text(
+                            text = "Grant 'Display Over Other Apps' Permission",
+                            color = AnyRollerOrange,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                MenuSwitchRow(
+                    title = "Wide Picture-in-Picture Strip",
+                    subtitle = "Automatic zero-permission fallback over Google Maps / Waze when Floating Overlay is off",
                     checked = cockpit.pipEnabled,
                     testTag = "switch_pip_enabled",
                     onCheckedChange = { enabled ->

@@ -17,6 +17,7 @@ private val Context.driverPrefsDataStore by preferencesDataStore(name = "anyroll
 
 data class CockpitLocalSettings(
     val autoLaunchExternalNav: Boolean = true, // ON by default (toggleable OFF in settings)
+    val floatingOverlayEnabled: Boolean = false, // Opt-in Floating Ride Info Card over Google Maps / Waze
     val mapThemeMode: String = "auto", // "auto" | "dark" | "light"
     val keepScreenAwake: Boolean = true,
     val autoBrightnessBoost: Boolean = false,
@@ -42,6 +43,7 @@ class DriverPreferencesStore(private val context: Context) {
 
         // Part 2 Cockpit Local Settings
         val AUTO_LAUNCH_EXTERNAL_NAV = booleanPreferencesKey("cockpit_auto_launch_ext_nav")
+        val FLOATING_OVERLAY_ENABLED = booleanPreferencesKey("cockpit_floating_overlay_enabled")
         val MAP_THEME_MODE = stringPreferencesKey("cockpit_map_theme_mode")
         val KEEP_SCREEN_AWAKE = booleanPreferencesKey("cockpit_keep_screen_awake")
         val AUTO_BRIGHTNESS_BOOST = booleanPreferencesKey("cockpit_auto_brightness_boost")
@@ -58,6 +60,7 @@ class DriverPreferencesStore(private val context: Context) {
     val cockpitSettingsFlow: Flow<CockpitLocalSettings> = context.driverPrefsDataStore.data.map { prefs ->
         CockpitLocalSettings(
             autoLaunchExternalNav = prefs[Keys.AUTO_LAUNCH_EXTERNAL_NAV] ?: true,
+            floatingOverlayEnabled = prefs[Keys.FLOATING_OVERLAY_ENABLED] ?: false,
             mapThemeMode = prefs[Keys.MAP_THEME_MODE] ?: "auto",
             keepScreenAwake = prefs[Keys.KEEP_SCREEN_AWAKE] ?: true,
             autoBrightnessBoost = prefs[Keys.AUTO_BRIGHTNESS_BOOST] ?: false,
@@ -77,6 +80,7 @@ class DriverPreferencesStore(private val context: Context) {
         context.driverPrefsDataStore.edit { prefs ->
             val current = CockpitLocalSettings(
                 autoLaunchExternalNav = prefs[Keys.AUTO_LAUNCH_EXTERNAL_NAV] ?: true,
+                floatingOverlayEnabled = prefs[Keys.FLOATING_OVERLAY_ENABLED] ?: false,
                 mapThemeMode = prefs[Keys.MAP_THEME_MODE] ?: "auto",
                 keepScreenAwake = prefs[Keys.KEEP_SCREEN_AWAKE] ?: true,
                 autoBrightnessBoost = prefs[Keys.AUTO_BRIGHTNESS_BOOST] ?: false,
@@ -92,6 +96,7 @@ class DriverPreferencesStore(private val context: Context) {
             val next = transform(current)
             updated = next
             prefs[Keys.AUTO_LAUNCH_EXTERNAL_NAV] = next.autoLaunchExternalNav
+            prefs[Keys.FLOATING_OVERLAY_ENABLED] = next.floatingOverlayEnabled
             prefs[Keys.MAP_THEME_MODE] = next.mapThemeMode
             prefs[Keys.KEEP_SCREEN_AWAKE] = next.keepScreenAwake
             prefs[Keys.AUTO_BRIGHTNESS_BOOST] = next.autoBrightnessBoost

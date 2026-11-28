@@ -17,6 +17,9 @@
     <!-- Android 13+ High-Priority Ride Offer & Chat Notifications -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Optional Opt-In Floating Ride Info Overlay over Google Maps / Waze -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
     <!-- Least-privilege package visibility for Navigation, WhatsApp, Browser & Phone -->
     <queries>
         <intent>
